@@ -78,8 +78,20 @@
 --            导致领奖逻辑全废；已改取第3返回值 state。
 --         ③ 新增「时间奖励(在线时长)」自动领：RewardsRequest:InvokeServer("ClaimPlayTime", i)，
 --            遍历 PlayTime.Tiles[{Got,Seconds}]，用 Played 判到时（真机实证异步到账）。
+--   v16.12：把「任务模式自动逃脱」缝合进全自动挂机（内嵌 AUTOESCAPE v2.2）：
+--         ① 投票改为按需：开「任务模式自动逃脱」时投 Escape，否则仍投 Survival；
+--         ② RoundMode=Escape 时全自动挂机让位给逃脱引擎：按 EscapeChecklist 顺序
+--            触发 ProximityPrompt 做任务(唤醒079/送驱动器/节点上传/骷髅钥匙/金库)，
+--            上传期间锚定藏在电脑上方 HideDepth 保持距离，全部完成后坐电梯逃离；
+--         ③ 回合切换(Intermission/Lobby)自动关闭逃脱引擎，不会在下一局残留；
+--         ④ 中途切模式(RoundMode 变化)也会立刻交接，不用等下一局；
+--         ⑤ 生存局仍走原逻辑(捡箱/传天花板/领奖)，逃脱局不再去捡箱。
+--   v16.12-lua：文件格式转为标准 Lua（.lua）。全篇 Luau 专有语法仅 5 处 `+=` 复合赋值，
+--         已统一改写为 `x = x + y`（Roblox Luau 与标准 Lua 两端都能跑）；
+--         `//` 只出现在 URL 注释里、`??` 只在字符串与注释中、无反引号插值/无 continue/
+--         无类型标注/无 goto，故其余无需改动。已用 Lua 5.4 编译器对整文件做语法校验通过。
 local G = getgenv()
-print("[ESP] 脚本已开始执行 v16.11（三栏 · 速度控制 · 物资箱 · 自动开门20m · 自动开箱 · 全自动挂机 · 049兼容）")
+print("[ESP] 脚本已开始执行 v16.12（三栏 · 速度控制 · 物资箱 · 自动开门20m · 自动开箱 · 全自动挂机 · 任务模式自动逃脱 · 049兼容）")
 local PlayersSvc = game:GetService("Players")
 local P = PlayersSvc.LocalPlayer
 local WS = game:GetService("Workspace")
@@ -150,7 +162,7 @@ do
                 local sub = rawget(v, "Stamina")
                 if type(sub) == "table" then pcall(function() cb(sub) end) end
             end
-            i += 1
+            i = i + 1
         end
     end
 
@@ -204,7 +216,7 @@ do
             if hasV then rawset(t, "Value", big) end
             if hasM then rawset(t, "Maximum", big) end
             if hasX then rawset(t, "Max", big) end
-            ST.Applied += 1
+            ST.Applied = ST.Applied + 1
         end)
         if not ST.Hooked and RC then
             local ok = pcall(function() RC.StaminaFraction = function(...) return 1 end end)
@@ -280,7 +292,7 @@ do
     local acc = 0
     ST.Heartbeat = RUS.Heartbeat:Connect(function(dt)
         if not ST.Enabled then return end
-        acc += dt
+        acc = acc + dt
         if acc < 2 then return end
         acc = 0
         if not playable() then pause(); return end
@@ -536,7 +548,7 @@ do
                 if not (#args == 1 and type(args[1]) == "string" and hasW(args[1], IGNORE_WORDS)) then
                     for j = 1, #args do
                         if type(args[j]) == "string" and hasW(args[j], BLOCK_WORDS) then
-                            B.Blocked += 1
+                            B.Blocked = B.Blocked + 1
                             log("拦截 -> " .. tostring(args[j]))
                             return nil
                         end
@@ -2516,7 +2528,7 @@ do
     local acc, sacc, hacc, facc = 0, 0, 0, 0
     ESP.Heartbeat = RUS.Heartbeat:Connect(function(dt)
         if not ESP.Enabled then return end
-        acc += dt; sacc += dt; hacc += dt; facc += dt
+        acc = acc + dt;sacc = sacc + dt;hacc = hacc + dt;facc = facc + dt
         if hacc >= ESP.HuntCheckInterval then
             hacc = 0
             ESP.HuntMode = isLocalSCP()
@@ -4689,7 +4701,830 @@ do
 
     print("[AUTOCRATE] 已加载 v16.9 · 箱前直开(fireproximityprompt·免碰按钮) · 默认关闭 · AUTOCRATE_DUMP()")
 end
--- 全自动挂机 AUTOFARM v1.1
+-- ============================================================
+-- 任务模式自动逃脱 AUTOESCAPE v2.2（内嵌版 · 由「全自动挂机」调度）
+-- 原独立脚本 v2.2 原样保留核心逻辑，只做三处适配：
+--   ① 投票关闭（AutoVote=false），统一由 AUTOFARM 投 Escape；
+--   ② start/stop 加代次守卫，避免模块被反复开关后残留两条主循环；
+--   ③ 外层包一层 do…end，局部变量不污染主 chunk（Lua 单函数 200 局部上限）。
+-- 状态源：RS.RoundMode / RoundPhase / EscapeChecklist / EscapeTargets /
+--         EscapeCarriers / EscapeExitPosition / LP.InRound / LP.Role / LP.Ghost
+-- ============================================================
+do
+local G = getgenv()
+local PlayersSvc = game:GetService("Players")
+
+-- 【清理】恢复加速研究期间注入的实验 hook（这些 hook 会触发反作弊导致被踢）。
+-- 只恢复本脚本自己 hook 过的函数，绝不动游戏其它逻辑。
+pcall(function()
+    if G._escapeHooked then
+        local RS = game:GetService("ReplicatedStorage")
+        local ev = RS and RS:FindFirstChild("Remotes") and RS.Remotes:FindFirstChild("EscapeEvent")
+        if ev and restorefunction then pcall(function() restorefunction(ev.FireServer) end) end
+    end
+    if G._ppHooked and restorefunction and G._ppOriginal then
+        pcall(function()
+            restorefunction(fireproximityprompt)
+            fireproximityprompt = G._ppOriginal
+            G.fireproximityprompt = G._ppOriginal
+        end)
+    end
+    G._escapeHooked = nil; G._ppHooked = nil; G._evInHooked = nil
+    G._escapeLog = nil; G._ppLog = nil; G._evIn = nil; G._ppOriginal = nil
+end)
+
+do
+    if G.AUTOESCAPE and G.AUTOESCAPE.Off then pcall(function() G.AUTOESCAPE.Off() end) end
+    G.AUTOESCAPE = nil
+
+    local LP = PlayersSvc.LocalPlayer
+    local WS = game:GetService("Workspace")
+    local RS = game:GetService("ReplicatedStorage")
+    local HS = game:GetService("HttpService")
+    local FPP = (getgenv and getgenv().fireproximityprompt) or _G.fireproximityprompt
+
+    -- 快速互动：任意 PP 的 hold 一开始立即 fire，跳过长按动画（用户提供脚本思路）
+    local PPS = game:GetService("ProximityPromptService")
+    local FastInteractConn = nil
+    local function enableFastInteract()
+        if FastInteractConn then return end
+        FastInteractConn = PPS.PromptButtonHoldBegan:Connect(function(prompt)
+            if prompt and prompt:IsA("ProximityPrompt") and FPP then
+                pcall(function() FPP(prompt) end)
+            end
+        end)
+    end
+    local function disableFastInteract()
+        if FastInteractConn then
+            pcall(function() FastInteractConn:Disconnect() end)
+            FastInteractConn = nil
+        end
+    end
+
+    local F = {
+        Enabled      = false,
+        AutoVote     = false,    -- 内嵌版：投票统一由 AUTOFARM 负责，避免一局投两次
+        Tick         = 0.5,      -- 主循环间隔(秒)
+        NodeHold     = 17,       -- 节点触发后地板下保持时长(秒)，>15s
+        HideDepth    = 12,       -- 藏身距离节点(studs)，<NODE_RANGE=16；向上藏天花板上方，防地面SCP(049/173)
+        StallSec     = 6,        -- 上传停滞多少秒判定可能超范围→逐档下调藏身高度重定位
+        PPRefresh    = 3,        -- PP 列表刷新间隔(秒)
+        Phase        = "待命（默认关闭）",
+        Current      = "无",
+        Escapes      = 0,
+        Votes        = 0,
+        Conn         = nil,
+        LoopTask     = nil,
+        VotedThisPhase = false,
+        CountedThisRound = false,
+        _ppCache     = nil,
+        _ppCacheTime = 0,
+    }
+    G.AUTOESCAPE = F
+
+    local function lo(s) return string.lower(tostring(s or "")) end
+
+    -- ============ 角色工具 ============
+    local function getHRP()
+        local ch = LP and LP.Character
+        return ch and ch:FindFirstChild("HumanoidRootPart") or nil
+    end
+    local function getHum()
+        local ch = LP and LP.Character
+        return ch and ch:FindFirstChildOfClass("Humanoid") or nil
+    end
+
+    -- 温和瞬移(不锚定)：直接置位清零速度，用于触发 PP 前（真机验证锚定会阻止触发）
+    local function tpSoft(pos)
+        local ch = LP and LP.Character
+        if not ch then return false end
+        local ok = pcall(function()
+            local hrp = ch:FindFirstChild("HumanoidRootPart")
+            if not hrp then return end
+            hrp.Anchored = false
+            hrp.CFrame = CFrame.new(pos)
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+        end)
+        return ok
+    end
+
+    -- 锚定瞬移：先【不锚定】置位让服务器同步新位置，再【锚定】固定。
+    -- 关键1：先 Anchored=true 再改 CFrame，位置不复制到服务器→SCP按旧位置击杀。
+    -- 关键2：绝不 ChangeState(Physics)，那会让角色变成布娃娃躺地（视频 bug 根因）。
+    local function tpAnchor(pos)
+        local ch = LP and LP.Character
+        if not ch then return false end
+        local ok = pcall(function()
+            local hrp = ch:FindFirstChild("HumanoidRootPart")
+            if not hrp then return end
+            -- 若已处于布娃娃/Physics，先恢复正常站立，避免躺地
+            local hum = ch:FindFirstChildOfClass("Humanoid")
+            if hum and hum:GetState() == Enum.HumanoidStateType.Physics then
+                hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+            end
+            -- 1) 不锚定置位 → 物理引擎更新位置并复制到服务器
+            hrp.Anchored = false
+            hrp.CFrame = CFrame.new(pos)
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+            task.wait(0.12)          -- 等位置同步到服务器
+            -- 2) 锚定在已同步的位置（不改 HumanoidState，避免布娃娃）
+            hrp.Anchored = true
+            hrp.CFrame = CFrame.new(pos)
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+        end)
+        return ok
+    end
+
+    -- ============ 逃脱状态读取 ============
+    local function inEscapeRound()
+        if RS:GetAttribute("RoundMode") ~= "Escape" then return false end
+        if RS:GetAttribute("RoundPhase") ~= "Playing" then return false end
+        if LP:GetAttribute("InRound") ~= true then return false end
+        if LP:GetAttribute("Role") == "SCP" then return false end
+        if LP:GetAttribute("Ghost") == true then return false end
+        return true
+    end
+
+    local function readChecklist()
+        local raw = RS:GetAttribute("EscapeChecklist")
+        if type(raw) ~= "string" or raw == "" then return nil end
+        local ok, data = pcall(function() return HS:JSONDecode(raw) end)
+        if not ok or type(data) ~= "table" or type(data.steps) ~= "table" then return nil end
+        return data.steps
+    end
+
+    local function readTargets()
+        local raw = RS:GetAttribute("EscapeTargets")
+        if type(raw) ~= "string" or raw == "" then return {} end
+        local ok, data = pcall(function() return HS:JSONDecode(raw) end)
+        if not ok or type(data) ~= "table" then return {} end
+        local list = {}
+        for _, t in ipairs(data) do
+            if type(t) == "table"
+                and type(t.x) == "number" and type(t.y) == "number" and type(t.z) == "number" then
+                list[#list + 1] = {
+                    pos   = Vector3.new(t.x, t.y, t.z),
+                    label = tostring(t.label or ""),
+                }
+            end
+        end
+        return list
+    end
+
+    local function readExit()
+        local v = RS:GetAttribute("EscapeExitPosition")
+        if typeof(v) == "Vector3" then return v end
+        return nil
+    end
+
+    -- 电梯位置：只认服务器下发的权威坐标，绝不用场景固定实例坐标。
+    -- 【v2.2 严重BUG修正】曾试图读 Vault_Exit.Markers.LiftCarZone 等固定名实例来
+    -- "提前"拿电梯坐标，但地图每局随机旋转/布局，实例坐标(如 -72,73,-356)与服务器
+    -- 真实 EXIT(如 356,73,-24)完全不同 → 传送到虚空无限下坠。已彻底删除该逻辑。
+    -- 现在：优先 EscapeExitPosition 属性；未下发时用 targets 里 label=EXIT 的坐标
+    -- (同样是服务器权威、跟随本局布局)，二者都没有才返回 nil 让流程等待。
+    local function readLiftPos()
+        local v = readExit()
+        if v then return v end
+        for _, t in ipairs(readTargets()) do
+            if t.label == "EXIT" and t.pos then return t.pos end
+        end
+        return nil
+    end
+
+    local function currentStep()
+        local steps = readChecklist()
+        if not steps then return nil end
+        for _, s in ipairs(steps) do
+            if type(s) == "table" and s.done ~= true then
+                return s, lo(s.text or "")
+            end
+        end
+        return nil
+    end
+
+    -- ============ PP 扫描（带缓存） ============
+    -- 返回全场景 ProximityPrompt 列表 {pp, action, obj, hold, enabled, part, pos}
+    -- 缓存所有 PP（含 disabled），因为节点/电脑上传开始后 PP 会变 en=false，
+    -- 但仍需按位置找到它来判断进度。
+    local function scanAllPPs(force)
+        local now = os.clock()
+        if not force and F._ppCache and (now - F._ppCacheTime) < F.PPRefresh then
+            return F._ppCache
+        end
+        local list = {}
+        pcall(function()
+            for _, d in ipairs(WS:GetDescendants()) do
+                if d:IsA("ProximityPrompt") then
+                    local parent = d.Parent
+                    local part = parent and (parent:IsA("BasePart") and parent or parent:FindFirstChildOfClass("BasePart"))
+                    list[#list + 1] = {
+                        pp      = d,
+                        action  = lo(d.ActionText),
+                        obj     = lo(d.ObjectText),
+                        hold    = d.HoldDuration or 0,
+                        enabled = d.Enabled,
+                        part    = part,
+                        pos     = part and part.Position or nil,
+                    }
+                end
+            end
+        end)
+        F._ppCache = list
+        F._ppCacheTime = now
+        return list
+    end
+
+    -- 按 action 关键词 和/或 obj 关键词 匹配 PP，返回最近的一个
+    -- onlyEnabled=true 时只返回可触发的(enabled) PP
+    local function findPP(actionKey, objKey, nearPos, onlyEnabled)
+        local pps = scanAllPPs()
+        local best, bestDist = nil, math.huge
+        for _, p in ipairs(pps) do
+            if onlyEnabled and not p.enabled then
+                -- 跳过
+            else
+                if (not actionKey or p.action:find(actionKey, 1, true))
+                    and (not objKey or p.obj:find(objKey, 1, true)) then
+                    local dist = 0
+                    if nearPos and p.pos then dist = (p.pos - nearPos).Magnitude end
+                    if dist < bestDist then
+                        best, bestDist = p, dist
+                    end
+                end
+            end
+        end
+        return best
+    end
+
+    -- 触发一个 PP：传送到其附近(不锚定) → fireproximityprompt
+    -- explicitPos: 当 PP 挂在 Attachment 上(无 part 坐标)时，用 targets 下发的坐标
+    local function triggerPP(pp, explicitPos)
+        if not pp or not FPP then return false end
+        local targetPos = pp.pos or explicitPos
+        local ok = false
+        pcall(function()
+            if targetPos then
+                -- 站在 PP 前方（下降 0.9 ≈ 地板），保证进入 MaxActivationDistance
+                tpSoft(targetPos + Vector3.new(0, -0.9, 0))
+                task.wait(0.35)
+            end
+            local hold = pp.hold > 0 and pp.hold or 0.2
+            local fired = FPP(pp.pp, hold, true)
+            ok = fired == true or fired == nil
+        end)
+        return ok
+    end
+
+    -- 触发"上传类"PP 并即时验证是否真正开始：
+    --   真机证据：Start upload / Upload drive 触发成功后 PP.Enabled 立即变 false。
+    --   失败(仍 enabled)时快速重试，不再藏起来空等 NodeHold 才发现没成功。
+    local function fireUploadAndVerify(p, explicitPos, maxAttempts)
+        if not p or not p.pp or not FPP then return false end
+        maxAttempts = maxAttempts or 4
+        for _ = 1, maxAttempts do
+            -- 已 disabled → 上传已在进行，视为成功
+            local ok, en = pcall(function() return p.pp.Enabled end)
+            if ok and en == false then return true end
+            -- 不锚定传送到 PP 前再触发
+            local targetPos = p.pos or explicitPos
+            pcall(function()
+                if targetPos then tpSoft(targetPos + Vector3.new(0, -0.9, 0)) end
+            end)
+            task.wait(0.15)
+            local hold = p.hold > 0 and p.hold or 0.2
+            pcall(function() FPP(p.pp, hold, true) end)
+            task.wait(0.35)
+            local ok2, en2 = pcall(function() return p.pp.Enabled end)
+            if ok2 and en2 == false then return true end
+        end
+        return false
+    end
+
+    -- 拾取"记忆驱动器"类PP并验证成功：反复触发直到 PP 变 disabled 或目标从 targets 消失。
+    -- 【v2.1 修正】旧 doPickupAllDrives 只触发一次就 wait(0.9) 跳过、从不验证，
+    --   偶发触发失败(距离/hold/PP缓存过期)就永久漏掉 → "拿不起来，要反复几次"。
+    --   真机证据同上传：拾取成功后该 PP.Enabled 立即变 false。
+    -- 每次强制 scanAllPPs(true) 刷新缓存，避免拿到刚被禁用却仍缓存为 enabled 的旧PP。
+    local function firePickupAndVerify(actionKey, objKey, nearPos, maxAttempts)
+        maxAttempts = maxAttempts or 8
+        -- 目标是否还在场（从 EscapeTargets 按坐标匹配，<4 视为同一个）
+        local function targetStillThere()
+            if not nearPos then return false end
+            for _, t in ipairs(readTargets()) do
+                if t.pos and (t.pos - nearPos).Magnitude < 4 then return true end
+            end
+            return false
+        end
+        for _ = 1, maxAttempts do
+            if not targetStillThere() then return true end  -- 目标已从 targets 消失=拿起成功
+            scanAllPPs(true)
+            local p = findPP(actionKey, objKey, nearPos, false)  -- 不过滤 enabled，拿到后自行判
+            if p and p.pp then
+                local ok, en = pcall(function() return p.pp.Enabled end)
+                if ok and en == false then return true end       -- 已 disabled=拿起成功
+                local targetPos = p.pos or nearPos
+                pcall(function()
+                    if targetPos then tpSoft(targetPos + Vector3.new(0, -0.9, 0)) end
+                    task.wait(0.18)
+                    local hold = p.hold > 0 and p.hold or 0.2
+                    FPP(p.pp, hold, true)
+                end)
+                task.wait(0.5)
+                local ok2, en2 = pcall(function() return p.pp.Enabled end)
+                if ok2 and en2 == false then return true end
+            end
+        end
+        return not targetStillThere()
+    end
+
+    -- 上传保持：锚定在屏幕【正上方】HideDepth，直到 isDone() 为真。
+    -- 【v2.1 修正 · 真机实证】删除旧的"停滞超时→逐档降高 12→8→4→0"逻辑：
+    --   上传本身就需要 15s(NODE_UPLOAD_SECONDS)，而旧 StallSec=6 会把正常的
+    --   "还没上传完"误判成停滞，导致角色一路降到屏幕位置(地面高度)暴露被杀。
+    --   真机连续采样已复现 y:115.6→111.6(高度8)→107.6(高度4)→103.6(高度0)。
+    --   且上传 PP 挂在 Screen 上，坐标与节点坐标一致，藏上方 12 时球形距离
+    --   仅 12 < NODE_RANGE 16，本就在范围内——降档根本无助于"不在范围内"。
+    -- 新策略：固定安全高度 + 每 8s 原地重同步(不锚定置位→锚定)防服务器位置
+    --   漂移；仅当位置真的漂移>3 才重定位。超时未完成交主循环下一轮重触发。
+    local function holdUpload(screenPos, maxWait, isDone)
+        if not screenPos then return false end
+        local hidePos = screenPos + Vector3.new(0, F.HideDepth, 0)
+        tpAnchor(hidePos)
+        local start = os.clock()
+        local resync = start
+        while os.clock() - start < maxWait do
+            if not F.Enabled or not inEscapeRound() then break end
+            if isDone() then return true end
+            -- 每 8s 原地重同步一次，高度不变，绝不往下掉（防服务器位置漂移 pause）
+            if os.clock() - resync >= 8 then
+                tpAnchor(hidePos)
+                resync = os.clock()
+            end
+            local hrp = getHRP()
+            if hrp and (not hrp.Anchored or (hrp.Position - hidePos).Magnitude > 3) then
+                tpAnchor(hidePos)
+            end
+            task.wait(F.Tick)
+        end
+        return isDone()
+    end
+
+    -- ============ 各任务动作 ============
+
+    -- 唤醒 079：Use PP obj="SCP-079 console"
+    local function doWake079()
+        F.Current = "唤醒 SCP-079"
+        local p = findPP(nil, "scp-079 console", nil, true)
+        if not p then return false end
+        triggerPP(p)
+        task.wait(1.5)
+        return true
+    end
+
+    -- 拾取记忆驱动器：把所有 MEMORY DRIVE 目标全部捡完，再统一交付
+    -- driveTargets: readTargets() 里 label=MEMORY DRIVE 的列表
+    local function doPickupAllDrives(driveTargets)
+        F.Current = "拾取记忆驱动器"
+        local picked = 0
+        for _, t in ipairs(driveTargets) do
+            -- 验证式拾取：反复触发直到该 drive 真正拿起(PP disabled 或目标消失)
+            local ok = firePickupAndVerify("take drive", "memory drive", t.pos, 8)
+            if not ok then
+                -- 换个更宽松的关键词再试一轮
+                ok = firePickupAndVerify("take", "drive", t.pos, 6)
+            end
+            if ok then picked = picked + 1 end
+        end
+        return picked > 0
+    end
+
+    -- 交付驱动器：到 DELIVER 目标（079 控制台）旁，触发 Use + 靠近自动交付
+    local function doDeliver(targetPos)
+        F.Current = "交付记忆驱动器"
+        tpSoft(targetPos + Vector3.new(0, -0.9, 2))
+        task.wait(0.5)
+        -- 尝试触发控制台 Use（双保险，靠近本身也可能自动交付）
+        local p = findPP(nil, "scp-079 console", targetPos, true)
+        if p then triggerPP(p) end
+        task.wait(2)
+        return true
+    end
+
+    -- 节点通电：Start upload → 触发后藏地板下保持 15s+
+    -- nodePos: 节点坐标（来自 targets 的 NODE/UPLOAD label）
+    local function doNode(nodePos)
+        F.Current = string.format("节点通电 @ %.0f,%.0f", nodePos.X, nodePos.Z)
+        -- 找该节点位置的 PP（不过滤 enabled，上传中 PP 会变 false）
+        local p = findPP("start upload", nil, nodePos, false)
+        if not p or not p.pos then
+            F.Phase = "③ 找不到该节点的上传电脑"
+            return false
+        end
+        -- 1) 若 PP 仍可触发 → 近距离触发并即时验证是否真的开始上传
+        --    失败(PP 没变 disabled)立即返回，主循环下一轮马上重试，不空等
+        if p.enabled then
+            if not fireUploadAndVerify(p, nil, 4) then
+                F.Phase = "③ 节点互动失败(即时重试)"
+                return false
+            end
+        end
+        -- 2) 上传已确认开始 → 藏到【电脑屏幕】正上方锚定保持，停滞则自适应降高重定位
+        --    （用 p.pos 屏幕实际位置，不是 nodePos；两者可能相差很远）
+        local function nodeDone()
+            for _, t in ipairs(readTargets()) do
+                if t.pos and (t.pos - nodePos).Magnitude < 2 then return false end
+            end
+            return true   -- 该节点从 targets 消失 = 完成
+        end
+        holdUpload(p.pos, F.NodeHold, nodeDone)
+        return true
+    end
+
+    -- 取骷髅钥匙：Take the key
+    local function doSkeletonKey(targetPos)
+        F.Current = "取骷髅钥匙"
+        local p = findPP("take the key", nil, targetPos, true)
+        if not p then
+            p = findPP("take", "key", targetPos, true)
+        end
+        if not p then return false end
+        triggerPP(p)
+        task.wait(1.5)
+        return true
+    end
+
+    -- 前向声明：doVaultDoor 需调用 doExit（电梯），但 doExit 定义在后面
+    local doExit
+
+    -- 金库门用钥匙：锚定到钥匙开关处触发（瞬间完成），随后不等提示直接去电梯
+    local function doVaultDoor(targetPos)
+        F.Current = "金库门用钥匙(锚定)"
+        if not targetPos then return false end
+        -- 找钥匙开关 PP（turn/key/switch），用锚定方式触发
+        local p = findPP("turn", "key", targetPos, true)
+        if not p then p = findPP("key", nil, targetPos, true) end
+        if not p then p = findPP("switch", nil, targetPos, true) end
+        if p then
+            -- 锚定到 PP/开关位置（瞬间完成，无需长按停留）
+            local at = p.pos or (targetPos + Vector3.new(0, -4.5, 0))
+            tpAnchor(at + Vector3.new(0, -0.9, 0))
+            task.wait(0.2)
+            triggerPP(p, at)
+            -- 验证钥匙 PP 是否真的触发（成功后 disabled），失败当场重试
+            local ok, en = pcall(function() return p.pp and p.pp.Enabled end)
+            if ok and en ~= false then
+                tpSoft(at + Vector3.new(0, -0.9, 0)); task.wait(0.15)
+                pcall(function() FPP(p.pp, p.hold > 0 and p.hold or 0.2, true) end)
+                task.wait(0.3)
+            end
+        else
+            -- 无 PP 则锚定到钥匙插入点（接触式）
+            tpAnchor(targetPos + Vector3.new(0, -4.5, 0))
+        end
+        -- 【v2.1】不再固定等 1.5s：转完钥匙立即用电梯缓存坐标直奔电梯。
+        -- 短轮询最多 3s 等门开(ExitPosition 出现或门实例打开)，比死等 1.5s+下轮更快。
+        local exit = readLiftPos()
+        if not exit then
+            for _ = 1, 6 do
+                task.wait(0.4)
+                exit = readLiftPos()
+                if exit then break end
+            end
+        end
+        if exit then
+            F.Phase = "⑤ 坐电梯(转钥匙即走)"
+            doExit(exit)
+        end
+        return true
+    end
+
+    -- 金库电脑上传：Upload drive obj="Vault computer" hold=3 → 触发后藏天花板上方
+    -- vaultPos: targets 里 VAULT PC 坐标（PP 挂在 Attachment 上无 part 坐标，必须用这个）
+    local function doVaultUpload(vaultPos)
+        F.Current = "金库电脑上传"
+        local p = findPP("upload drive", "vault computer", nil, true)
+        -- 关键修复：PP 的 part 坐标是 nil，用 targets 下发的 VAULT PC 坐标传送
+        local actPos = vaultPos or (p and p.pos)
+        if not actPos then
+            F.Phase = "④ 无金库电脑坐标"
+            return false
+        end
+        -- 即时验证上传是否真的开始，失败立即返回让主循环重试
+        if p then
+            if not fireUploadAndVerify(p, actPos, 4) then
+                F.Phase = "④ 金库上传互动失败(即时重试)"
+                return false
+            end
+        end
+        -- 【v2.1】上传保持：以"上传 PP 变 disabled"为进行中标志，保持约 hold+1s
+        -- 即视为上传完成，不再死等 EscapeExitPosition 下发(那是门开后才出、有延迟，
+        -- 导致角色一直钉在天花板上方)。门开信号(readLiftPos)出现则立刻走。
+        if actPos then
+            local uploaded = false
+            local upStart = os.clock()
+            local holdSec = (p and p.hold > 0 and p.hold or 3) + 1.5  -- hold=3 → 约4.5s
+            while os.clock() - upStart < math.max(holdSec, 6) do
+                if not F.Enabled or not inEscapeRound() then break end
+                if readLiftPos() then break end       -- 门已开/电梯可用 → 立刻走
+                local hrp = getHRP()
+                if hrp then tpAnchor(actPos + Vector3.new(0, F.HideDepth, 0)) end
+                task.wait(F.Tick)
+            end
+            uploaded = true
+        end
+        -- 立即直奔电梯：服务器权威坐标(EscapeExitPosition 或 targets 的 EXIT)
+        local exit = readLiftPos()
+        if not exit then
+            for _ = 1, 6 do
+                task.wait(0.4)
+                exit = readLiftPos()
+                if exit then break end
+            end
+        end
+        if exit then
+            F.Phase = "⑤ 坐电梯(上传即走)"
+            doExit(exit)
+        end
+        return true
+    end
+
+    -- 坐电梯逃离
+    -- 【v2.2 安全校验】电梯坐标只认服务器权威值；先校验合法性(Y≈地板、X/Z在地图内)，
+    -- 非法则拒绝钉位(防"传送到虚空反复下坠")。每轮重读权威坐标，服务器一旦下发更新
+    -- 立即用新坐标；Escaped/回合结束立即停，绝不持续钉死旧 CFrame。
+    doExit = function(exitPos)
+        -- 已逃脱：电梯动画接管，直接返回，不处理坐标(逃脱后服务器会清空 Exit 坐标)
+        if LP:GetAttribute("Escaped") == true then return true end
+        F.Current = "坐电梯逃离"
+        local function valid(p)
+            return p and p.Y > 85 and p.Y < 160 and math.abs(p.X) < 210 and math.abs(p.Z) < 210
+        end
+        if not valid(exitPos) then
+            F.Phase = "⑤ 电梯坐标非法(拒绝传送,等服务器更新)"
+            return false
+        end
+        tpSoft(exitPos + Vector3.new(0, 1, 0))
+        local start = os.clock()
+        while os.clock() - start < 12 do
+            if not F.Enabled then break end
+            if LP:GetAttribute("Escaped") == true then break end
+            if RS:GetAttribute("RoundPhase") ~= "Playing" then break end
+            -- 每轮重读权威坐标，若服务器更新了则立刻采用新位置
+            local fresh = readLiftPos()
+            if fresh and valid(fresh) and (fresh - exitPos).Magnitude > 1 then
+                exitPos = fresh
+            end
+            if not valid(exitPos) then break end
+            pcall(function()
+                local hrp = getHRP()
+                if hrp then
+                    hrp.CFrame = CFrame.new(exitPos + Vector3.new(0, 1, 0))
+                    hrp.AssemblyLinearVelocity = Vector3.zero
+                end
+            end)
+            task.wait(F.Tick)
+        end
+        return true
+    end
+
+    -- ============ 主逃脱决策循环 ============
+    -- 每轮：读清单第一个未完成步骤 → 按 text 关键词 + targets 决定动作
+    local function doEscape()
+        local exitPos = readExit()
+        if exitPos then
+            doExit(exitPos)
+            return
+        end
+
+        local step, stepText = currentStep()
+        local targets = readTargets()
+        F.Targets = #targets
+
+        if not step or not stepText then
+            F.Phase = "等待服务器下发清单"
+            return
+        end
+
+        -- 收集各 label 目标（判子阶段用，不依赖系统延迟冒提示）
+        local deliverPos = nil
+        local driveTargets, lastDrivePos, vaultPcPos = {}, nil, nil
+        for _, t in ipairs(targets) do
+            if t.label == "DELIVER" then deliverPos = t.pos end
+            if t.label == "MEMORY DRIVE" then driveTargets[#driveTargets + 1] = t end
+            if t.label == "LAST DRIVE" then lastDrivePos = t.pos end
+            if t.label == "VAULT PC" then vaultPcPos = t.pos end
+        end
+
+        if stepText:find("wake scp", 1, true) then
+            F.Phase = "① 唤醒 SCP-079"
+            doWake079()
+        elseif stepText:find("memory drive", 1, true) then
+            -- 先把所有 MEMORY DRIVE 全部捡完，最后一个都不剩才去交付
+            if #driveTargets > 0 then
+                F.Phase = "② 拾取记忆驱动器(" .. #driveTargets .. "个)"
+                doPickupAllDrives(driveTargets)
+            elseif deliverPos then
+                F.Phase = "② 交付记忆驱动器"
+                doDeliver(deliverPos)
+            else
+                F.Phase = "② 等待驱动器/交付目标"
+            end
+        elseif stepText:find("node", 1, true) or stepText:find("power", 1, true) then
+            F.Phase = "③ 节点通电"
+            -- 找最近的未完成节点目标（NODE 或 UPLOAD label）
+            local nodeTarget = nil
+            for _, t in ipairs(targets) do
+                if t.label == "NODE" or t.label == "UPLOAD" then nodeTarget = t.pos; break end
+            end
+            if nodeTarget then
+                doNode(nodeTarget)
+            else
+                F.Phase = "③ 无节点目标(可能已完成)"
+            end
+        elseif stepText:find("skeleton key", 1, true) then
+            F.Phase = "取骷髅钥匙"
+            local keyPos = nil
+            for _, t in ipairs(targets) do if keyPos == nil then keyPos = t.pos end end
+            doSkeletonKey(keyPos)
+        elseif stepText:find("vault door", 1, true) then
+            F.Phase = "金库门用钥匙"
+            local doorPos = nil
+            for _, t in ipairs(targets) do if doorPos == nil then doorPos = t.pos end end
+            doVaultDoor(doorPos)
+        elseif stepText:find("last drive", 1, true) or stepText:find("vault computer", 1, true) then
+            F.Phase = "④ 金库电脑上传"
+            -- 先看 targets 判定子阶段：LAST DRIVE → 拾取最终驱动器；VAULT PC → 上传
+            local subMode, subPos = nil, nil
+            for _, t in ipairs(targets) do
+                if t.label == "LAST DRIVE" then subMode = "pick"; subPos = t.pos end
+                if t.label == "VAULT PC" then subMode = "upload"; subPos = t.pos end
+            end
+            if subMode == "pick" then
+                F.Current = "拾取最终驱动器"
+                local ok = firePickupAndVerify("take drive", "last drive", subPos, 8)
+                if not ok then firePickupAndVerify("take", "drive", subPos, 6) end
+            elseif subMode == "upload" then
+                doVaultUpload(subPos)
+            else
+                F.Phase = "④ 等待最终驱动器目标"
+            end
+        elseif stepText:find("elevator", 1, true) then
+            F.Phase = "⑤ 坐电梯"
+            -- 电梯未出坐标时，去最后一个目标
+            if targets[1] then doExit(targets[1].pos) end
+        else
+            F.Phase = "未知步骤: " .. stepText
+        end
+    end
+
+    -- ============ 投票 ============
+    local function voteEscape()
+        local ok = false
+        pcall(function()
+            local remotes = RS:FindFirstChild("Remotes")
+            local rv = remotes and remotes:FindFirstChild("RoundVote")
+            if rv then
+                rv:FireServer("Escape")
+                F.Votes = F.Votes + 1
+                ok = true
+            end
+        end)
+        return ok
+    end
+
+    -- ============ 主状态机 ============
+    local function onPhase()
+        if not F.Enabled then return end
+        local phase = RS:GetAttribute("RoundPhase")
+        if phase == "Voting" then
+            if F.AutoVote and not F.VotedThisPhase then
+                F.VotedThisPhase = true
+                task.spawn(function()
+                    task.wait(0.6)
+                    local ok = voteEscape()
+                    F.Phase = ok and "已投 Escape" or "投票失败"
+                end)
+            end
+        elseif phase == "Playing" then
+            F.VotedThisPhase = false
+            if inEscapeRound() then
+                F.Phase = "运行中"
+            else
+                F.Phase = "生存模式(非逃脱)"
+            end
+        elseif phase == "Intermission" or phase == "Lobby" then
+            F.VotedThisPhase = false
+            F.CountedThisRound = false
+            F.Current = "无"
+            F.Targets = 0
+            F.Phase = phase == "Lobby" and "大厅" or "局间休息"
+        end
+    end
+
+    local function start()
+        enableFastInteract()   -- 快速互动（跳过 hold 长按）
+        if F.Conn then return end
+        -- v16.12：代次守卫，stop() 后旧循环立即退出，绝不出现两条主循环抢着传送
+        F.Gen = (F.Gen or 0) + 1
+        local gen = F.Gen
+        F.Conn = RS:GetAttributeChangedSignal("RoundPhase"):Connect(onPhase)
+        pcall(onPhase)
+        -- 常驻主循环：跨回合持续运行，回合切换不会杀死协程
+        -- （旧版 while 条件带 inEscapeRound，切回合瞬间协程退出后不再重建，导致脚本卡死）
+        if not F.LoopTask or coroutine.status(F.LoopTask) == "dead" then
+            F.LoopTask = task.spawn(function()
+                while F.Enabled and (not F.Gen or F.Gen == gen) do
+                    -- 已逃脱：只计数，不再做任务/传送（避免电梯动画期间被甩出地图）
+                    if LP:GetAttribute("Escaped") == true then
+                        if not F.CountedThisRound then
+                            F.CountedThisRound = true
+                            F.Escapes = F.Escapes + 1
+                        end
+                    elseif inEscapeRound() then
+                        pcall(doEscape)
+                    end
+                    task.wait(F.Tick)
+                end
+                F.Phase = "已关闭"
+            end)
+        end
+    end
+    local function stop()
+        F.Gen = (F.Gen or 0) + 1
+        disableFastInteract()
+        if F.Conn then pcall(function() F.Conn:Disconnect() end) end
+        F.Conn = nil
+        F.LoopTask = nil
+    end
+
+    -- ============ 对外接口 ============
+    F.SetEnabled = function(v)
+        F.Enabled = v and true or false
+        if F.Enabled then
+            start()
+            F.Phase = "运行中"
+            warn("[AUTOESCAPE] 已开启：自动投 Escape / 按序做任务 / 藏地板下 / 坐电梯")
+        else
+            stop()
+            F.Phase = "待命（已关闭）"
+            warn("[AUTOESCAPE] 已关闭")
+        end
+        return F.Enabled
+    end
+    F.SetAutoVote = function(v) F.AutoVote = v and true or false; return F.AutoVote end
+    F.SetNodeHold = function(v) if type(v) == "number" then F.NodeHold = math.max(3, v) end; return F.NodeHold end
+    F.SetStallSec = function(v) if type(v) == "number" then F.StallSec = math.max(2, v) end; return F.StallSec end
+    F.SetHideDepth = function(v) if type(v) == "number" then F.HideDepth = math.max(3, v) end; return F.HideDepth end
+    F.VoteNow = function() return voteEscape() end
+    F.Dump = function()
+        local targets = readTargets()
+        local tlist = {}
+        for i, t in ipairs(targets) do
+            tlist[#tlist + 1] = string.format("[%s @ %.0f,%.0f,%.0f]", t.label, t.pos.X, t.pos.Y, t.pos.Z)
+        end
+        local steps = readChecklist()
+        local slist = {}
+        if steps then
+            for i, s in ipairs(steps) do
+                slist[#slist + 1] = string.format("%d.[%s]%s%s", i, s.done and "✓" or " ", tostring(s.text or ""),
+                    s.detail and ("(" .. tostring(s.detail) .. ")") or "")
+            end
+        end
+        return table.concat({
+            "=== AUTOESCAPE v2.0 Dump ===",
+            "Enabled=" .. tostring(F.Enabled) .. " Phase=" .. tostring(F.Phase),
+            "RoundMode=" .. tostring(RS:GetAttribute("RoundMode"))
+                .. " RoundPhase=" .. tostring(RS:GetAttribute("RoundPhase")),
+            "当前目标(" .. #targets .. "): " .. (#tlist > 0 and table.concat(tlist, " ") or "无"),
+            "电梯坐标: " .. tostring(readExit()),
+            "累计投票=" .. tostring(F.Votes) .. " 累计逃脱=" .. tostring(F.Escapes),
+            "清单: " .. (#slist > 0 and table.concat(slist, " ") or "无"),
+        }, "\n")
+    end
+    F.Off = function()
+        F.Enabled = false
+        stop()
+        G.AUTOESCAPE = nil
+    end
+
+    pcall(function()
+        local envs = { G }
+        if _G and _G ~= G then envs[#envs + 1] = _G end
+        for _, e in ipairs(envs) do
+            e.AUTOESCAPE_DUMP = function() print(F.Dump()) end
+            e.AUTOESCAPE_VOTE = function() return F.VoteNow() end
+        end
+    end)
+
+    print("[AUTOESCAPE] 已加载 v2.2(内嵌 AUTOFARM) · 按清单做任务+藏身上方+坐电梯 · 由全自动挂机调度 · AUTOESCAPE_DUMP()")
+end
+end
+
+-- 全自动挂机 AUTOFARM v1.2
 -- ============================================================
 do
     if G.AUTOFARM and G.AUTOFARM.Off then pcall(function() G.AUTOFARM.Off() end) end
@@ -4702,19 +5537,23 @@ do
 
     local F = {
         Enabled   = false,
-        AutoVote  = true,   -- 自动选生存
-        AutoLoot  = true,   -- 自动捡物资箱
-        AutoRoof  = true,   -- 捡完传天花板
+        AutoVote  = true,   -- 自动投票（开逃脱时投 Escape，否则投 Survival）
+        AutoLoot  = true,   -- 自动捡物资箱（仅生存局）
+        AutoRoof  = true,   -- 捡完传天花板（仅生存局）
         AutoClaim = true,   -- 自动领任务奖励
+        AutoEscape = true,  -- v16.12：任务模式(Escape)时接管做清单任务+坐电梯
         ClaimEvery = 20,    -- 领奖检查间隔(秒)
         Phase     = "待命（默认关闭）",
+        Mode      = "无",   -- 本局模式：Escape / Survival / 无
         Crates    = 0,      -- 本轮扫到的可开箱数
         Looted    = 0,      -- 本轮已开箱数
         Looting   = false,  -- 是否正在捡箱
         Votes     = 0,      -- 累计投票次数
+        LastVote  = "无",
         Claims    = 0,      -- 累计领奖次数
         LastClaim = "无",
         Conn      = nil,
+        ModeConn  = nil,
         ClaimConn = nil,
     }
     G.AUTOFARM = F
@@ -4792,19 +5631,56 @@ do
         end)
     end
 
-    -- ============ ① 自动选生存 ============
-    local function voteSurvival()
+    -- ============ ① 投票（生存 / 任务逃脱）============
+    -- v16.12：开放「任务模式自动逃脱」时投 Escape，否则维持原来的投 Survival。
+    -- 投票只由本模块发起（内嵌 AUTOESCAPE 的 AutoVote 已置 false），绝不会一局投两票。
+    local function voteOne(want)
         local ok = false
         pcall(function()
             local remotes = RS:FindFirstChild("Remotes")
             local rv = remotes and remotes:FindFirstChild("RoundVote")
             if rv then
-                rv:FireServer("Survival")
+                rv:FireServer(want)
                 F.Votes = F.Votes + 1
+                F.LastVote = want
                 ok = true
             end
         end)
-        return ok
+        return ok, want
+    end
+    local function voteRound()
+        return voteOne((F.AutoEscape and "Escape") or "Survival")
+    end
+    local function voteSurvival()   -- 兼容旧调用：本票强制投生存，不改开关
+        return voteOne("Survival")
+    end
+
+    -- ============ ①' 任务模式逃脱引擎调度 ============
+    -- 引擎 = 内嵌的 G.AUTOESCAPE（读 EscapeChecklist / EscapeTargets，按序触发
+    -- ProximityPrompt、上传时锚定藏在屏幕上方、全部完成后坐电梯）。
+    -- 这里只负责「什么时候开、什么时候关」，具体干活动作全在引擎里。
+    local function escapeEngine() return G.AUTOESCAPE end
+
+    local function setEscape(on)
+        local e = escapeEngine()
+        if not e then return false end
+        if on then
+            if not e.Enabled then e.SetEnabled(true) end
+        else
+            if e.Enabled then e.SetEnabled(false) end
+        end
+        return true
+    end
+
+    -- 是否「本局该做逃脱」：模式=逃脱 + 阶段=进行中 + 自己不是 SCP/鬼魂
+    local function shouldEscape()
+        if not F.AutoEscape then return false end
+        if RS:GetAttribute("RoundMode") ~= "Escape" then return false end
+        if RS:GetAttribute("RoundPhase") ~= "Playing" then return false end
+        if LP:GetAttribute("InRound") ~= true then return false end
+        if LP:GetAttribute("Role") == "SCP" then return false end
+        if LP:GetAttribute("Ghost") == true then return false end
+        return true
     end
 
     -- ============ ② 自动捡物资箱 ============
@@ -4939,46 +5815,77 @@ do
         return n, table.concat(what, ",")
     end
 
-    -- ============ 主状态机（监听 RoundPhase）============
+    -- ============ 主状态机（监听 RoundPhase / RoundMode）============
+    -- v16.12：本轮如果是 Escape（任务模式），不捡箱、不传天花板，直接把控制权
+    -- 交给内嵌逃脱引擎；生存局照旧。任何切回/退出都立即关闭引擎，不留残留。
     local function onPhase()
         if not F.Enabled then return end
         local phase = RS:GetAttribute("RoundPhase")
+        local mode  = RS:GetAttribute("RoundMode")
+
         if phase == "Voting" then
+            F.Mode = "投票"
             if F.AutoVote and not F.VotedThisPhase then
                 F.VotedThisPhase = true
                 task.spawn(function()
                     task.wait(0.6)
-                    local ok = voteSurvival()
-                    F.Phase = ok and "已投生存" or "投票失败"
+                    local ok, want = voteRound()
+                    F.Phase = ok and ("已投 " .. tostring(want)) or "投票失败"
                 end)
+            elseif not F.AutoVote then
+                F.Phase = "投票中(不自动投票)"
             end
         elseif phase == "Playing" then
             F.VotedThisPhase = false
-            if F.AutoLoot and not F.Looting then
-                F.Looting = true
-                task.spawn(function()
-                    F.Phase = "开始捡箱"
-                    lootCrates()
-                    if F.Enabled and F.AutoRoof then
-                        gotoRoof()
+            F.Mode = tostring(mode or "?")
+            if mode == "Escape" then
+                -- ===== 任务模式：全自动逃脱 =====
+                F.Looting = false
+                if LP:GetAttribute("Role") == "SCP" then
+                    setEscape(false)
+                    F.Phase = "任务模式：本局你是 SCP"
+                elseif shouldEscape() then
+                    F.Phase = "任务模式：自动逃脱"
+                    if not setEscape(true) then
+                        F.Phase = "任务模式：缺少 AUTOESCAPE 引擎"
                     end
-                    F.Looting = false
-                    if F.Enabled and F.Phase ~= "已传天花板" then
-                        F.Phase = "挂机中"
-                    end
-                end)
+                else
+                    setEscape(false)
+                    F.Phase = "任务模式：未参与(旁观/已逃脱)"
+                end
+            else
+                -- ===== 生存模式：原挂机流程 =====
+                setEscape(false)
+                if F.AutoLoot and not F.Looting then
+                    F.Looting = true
+                    task.spawn(function()
+                        F.Phase = "开始捡箱"
+                        lootCrates()
+                        if F.Enabled and F.AutoRoof then
+                            gotoRoof()
+                        end
+                        F.Looting = false
+                        if F.Enabled and F.Phase ~= "已传天花板" then
+                            F.Phase = "挂机中"
+                        end
+                    end)
+                end
             end
-        elseif phase == "Intermission" then
+        elseif phase == "Intermission" or phase == "Lobby" then
             F.Looting = false
             F.VotedThisPhase = false
             F.Crates, F.Looted = 0, 0
-            F.Phase = "局间休息"
+            F.Mode = "无"
+            setEscape(false)   -- 回合结束立刻收手，下一局不残留
+            F.Phase = (phase == "Lobby") and "大厅" or "局间休息"
         end
     end
 
     local function start()
         if F.Conn then return end
         F.Conn = RS:GetAttributeChangedSignal("RoundPhase"):Connect(onPhase)
+        -- v16.12：中途切模式（例如管理员直接开/关逃脱）也立刻交接，不等下一局
+        F.ModeConn = RS:GetAttributeChangedSignal("RoundMode"):Connect(onPhase)
         pcall(onPhase)
         -- 领奖定时器
         if F.AutoClaim then
@@ -4993,8 +5900,11 @@ do
         end
     end
     local function stop()
+        setEscape(false)   -- 关闭总开关时同步关掉逃脱引擎，避免它继续传送
         if F.Conn then pcall(function() F.Conn:Disconnect() end) end
+        if F.ModeConn then pcall(function() F.ModeConn:Disconnect() end) end
         F.Conn = nil
+        F.ModeConn = nil
         F.Looting = false
     end
 
@@ -5004,7 +5914,7 @@ do
         if F.Enabled then
             start()
             F.Phase = "运行中"
-            warn("[AUTOFARM] 已开启：自动选生存/捡箱/传天花板/领奖励")
+            warn("[AUTOFARM] 已开启：投票(生存/逃脱) + 生存局捡箱躲藏 + 任务模式自动逃脱 + 领奖励")
         else
             stop()
             F.Phase = "待命（已关闭）"
@@ -5016,6 +5926,20 @@ do
     F.SetAutoLoot  = function(v) F.AutoLoot = v and true or false; return F.AutoLoot end
     F.SetAutoRoof  = function(v) F.AutoRoof = v and true or false; return F.AutoRoof end
     F.SetAutoClaim = function(v) F.AutoClaim = v and true or false; return F.AutoClaim end
+    -- v16.12：任务模式逃脱开关；关掉时若正在逃脱，立刻停手不再传送
+    F.SetAutoEscape = function(v)
+        F.AutoEscape = v and true or false
+        if not F.AutoEscape then setEscape(false) end
+        return F.AutoEscape
+    end
+    -- 手动立即开始/停止逃脱（不等回合判断）
+    F.EscapeNow = function()
+        if not escapeEngine() then return false, "缺少 AUTOESCAPE 引擎" end
+        if not setEscape(true) then return false, "引擎启动失败" end
+        F.Phase = "任务模式：手动逃脱"
+        return true
+    end
+    F.StopEscape = function() setEscape(false); return true end
     F.ClaimNow = function()
         local n, what = claimRewards()
         F.Phase = "领奖：" .. (n > 0 and ("+" .. n .. " " .. what) or "无可领")
@@ -5031,17 +5955,27 @@ do
         return F.Crates
     end
     F.GotoRoofNow = function() return gotoRoof() end
-    F.VoteNow = function() return voteSurvival() end
+    F.VoteNow = function() return voteRound() end
     F.Dump = function()
+        local e = escapeEngine()
+        local esc = "无"
+        if e then
+            esc = string.format("Enabled=%s Phase=%s Current=%s 累计逃脱=%s",
+                tostring(e.Enabled), tostring(e.Phase), tostring(e.Current), tostring(e.Escapes))
+        end
         return table.concat({
-            "=== AUTOFARM v1.1 Dump ===",
-            "Enabled=" .. tostring(F.Enabled) .. " Phase=" .. tostring(F.Phase),
+            "=== AUTOFARM v1.2 Dump ===",
+            "Enabled=" .. tostring(F.Enabled) .. " Phase=" .. tostring(F.Phase)
+                .. " Mode=" .. tostring(F.Mode),
             "AutoVote=" .. tostring(F.AutoVote) .. " AutoLoot=" .. tostring(F.AutoLoot)
-                .. " AutoRoof=" .. tostring(F.AutoRoof) .. " AutoClaim=" .. tostring(F.AutoClaim),
+                .. " AutoRoof=" .. tostring(F.AutoRoof) .. " AutoClaim=" .. tostring(F.AutoClaim)
+                .. " AutoEscape=" .. tostring(F.AutoEscape),
             "本轮扫箱=" .. tostring(F.Crates) .. " 已开=" .. tostring(F.Looted),
-            "累计投票=" .. tostring(F.Votes) .. " 累计领奖=" .. tostring(F.Claims)
-                .. " 最近=" .. tostring(F.LastClaim),
-            "RoundPhase=" .. tostring(RS:GetAttribute("RoundPhase")),
+            "累计投票=" .. tostring(F.Votes) .. "(最近 " .. tostring(F.LastVote) .. ")"
+                .. " 累计领奖=" .. tostring(F.Claims) .. " 最近=" .. tostring(F.LastClaim),
+            "RoundMode=" .. tostring(RS:GetAttribute("RoundMode"))
+                .. " RoundPhase=" .. tostring(RS:GetAttribute("RoundPhase")),
+            "任务逃脱引擎: " .. esc,
         }, "\n")
     end
     F.Off = function()
@@ -5061,10 +5995,11 @@ do
             e.AUTOFARM_LOOT  = function() return F.LootNow() end
             e.AUTOFARM_ROOF  = function() return F.GotoRoofNow() end
             e.AUTOFARM_VOTE  = function() return F.VoteNow() end
+            e.AUTOFARM_ESCAPE = function() return F.EscapeNow() end
         end
     end)
 
-    print("[AUTOFARM] 已加载 v1.1 · 全自动挂机(选生存/捡箱/传天花板/领奖励) · 默认关闭 · AUTOFARM_DUMP()")
+    print("[AUTOFARM] 已加载 v1.2 · 全自动挂机(投票/生存捡箱躲藏/任务模式自动逃脱/领奖励) · 默认关闭 · AUTOFARM_DUMP()")
 end
 
 -- 黑曜石 UI（开源原本：https://github.com/NightForRoblox/Obsidian）
@@ -5411,19 +6346,19 @@ local function buildObsidianUI(Library)
         end
     end)
 
-    -- ===== 全自动挂机 v16.10（防护栏 · 选生存/捡箱/传天花板/领奖励）=====
+    -- ===== 全自动挂机 v16.12（防护栏 · 投票/生存挂机/任务模式自动逃脱/领奖励）=====
     local GFARM = TabGuard:AddRightGroupbox("全自动挂机", "tower")
     GFARM:AddToggle("autoFarm", {
         Text = "启用全自动挂机", Default = false,
-        Tooltip = "私服挂机专用：自动选生存(Voting阶段投Survival)、开局自动TP+走近捡完所有物资箱、捡完传最高天花板躲藏、定时自动领任务/每日奖励。真机实证：PivotTo瞬移不回弹、领奖走RewardsRequest、投票走RoundVote",
+        Tooltip = "私服挂机专用：投票阶段自动投(Escape优先，可关)、生存局自动捡箱+传天花板躲藏、任务模式(Escape)自动按清单做任务并坐电梯、定时领任务/每日奖励。真机实证：PivotTo瞬移不回弹、领奖走RewardsRequest、投票走RoundVote、逃脱靠EscapeChecklist/EscapeTargets+ProximityPrompt",
         Callback = function(v)
             if G.AUTOFARM then G.AUTOFARM.SetEnabled(v) end
             Library:Notify("全自动挂机 " .. (v and "已开启" or "已关闭"), 2)
         end,
     })
     GFARM:AddToggle("autoFarmVote", {
-        Text = "自动选生存", Default = true,
-        Tooltip = "进入 Voting 阶段自动投 Survival",
+        Text = "自动投票（逃脱优先）", Default = true,
+        Tooltip = "Voting 阶段自动投票：开启任务模式逃脱时投 Escape，否则投 Survival",
         Callback = function(v) if G.AUTOFARM then G.AUTOFARM.SetAutoVote(v) end end,
     })
     GFARM:AddToggle("autoFarmLoot", {
@@ -5441,6 +6376,23 @@ local function buildObsidianUI(Library)
         Tooltip = "定时拉 Snapshot，自动领 ClaimDaily + 已完成的 ClaimQuest",
         Callback = function(v) if G.AUTOFARM then G.AUTOFARM.SetAutoClaim(v) end end,
     })
+    -- v16.12：任务模式自动逃脱（内嵌 AUTOESCAPE 引擎的使用权归此处）
+    GFARM:AddToggle("autoFarmEscape", {
+        Text = "任务模式自动逃脱", Default = true,
+        Tooltip = "RoundMode=Escape 时接管：按 EscapeChecklist 顺序触发 ProximityPrompt 做任务(唤醒079/送驱动器/节点上传/骷髅钥匙/金库)，上传时锚定藏在电脑上方保持距离，全部完成后用服务器权威电梯坐标逃离。生存局不受影响",
+        Callback = function(v)
+            if G.AUTOFARM then G.AUTOFARM.SetAutoEscape(v) end
+            Library:Notify("任务模式自动逃脱 " .. (v and "已开启" or "已关闭"), 2)
+        end,
+    })
+    GFARM:AddButton({ Text = "🚪 立即执行逃脱流程", Func = function()
+        if not G.AUTOFARM then return end
+        local ok, err = G.AUTOFARM.EscapeNow()
+        Library:Notify(ok and "逃脱引擎已启动" or ("启动失败：" .. tostring(err)), 2)
+    end })
+    GFARM:AddButton({ Text = "🛑 停止逃脱", Func = function()
+        if G.AUTOFARM then G.AUTOFARM.StopEscape(); Library:Notify("逃脱引擎已停止", 2) end
+    end })
     GFARM:AddButton({ Text = "⚡ 立即领奖励", Func = function()
         if G.AUTOFARM then
             local n = G.AUTOFARM.ClaimNow()
@@ -5457,15 +6409,19 @@ local function buildObsidianUI(Library)
         end
     end })
     local gfSt = GFARM:AddLabel("状态：待命（默认关闭）")
-    local gfCnt = GFARM:AddLabel("箱 0 · 已开 0 · 投票 0 · 领奖 0")
-    GFARM:AddLabel("诊断：G.AUTOFARM.Dump()")
+    local gfCnt = GFARM:AddLabel("箱 0 · 已开 0 · 投票 0 · 领奖 0 · 逃脱 0")
+    GFARM:AddLabel("诊断：G.AUTOFARM.Dump() / AUTOESCAPE_DUMP()")
     task.spawn(function()
         while G.AUTOFARM do
             pcall(function()
                 local f = G.AUTOFARM
-                setLbl(gfSt, "状态：" .. tostring(f.Phase))
+                local e = G.AUTOESCAPE
+                local txt = tostring(f.Phase)
+                if e and e.Enabled then txt = txt .. " | " .. tostring(e.Current) end
+                setLbl(gfSt, "状态：" .. txt)
                 setLbl(gfCnt, "箱 " .. tostring(f.Crates) .. " · 已开 " .. tostring(f.Looted)
-                    .. " · 投票 " .. tostring(f.Votes) .. " · 领奖 " .. tostring(f.Claims))
+                    .. " · 投票 " .. tostring(f.Votes) .. " · 领奖 " .. tostring(f.Claims)
+                    .. " · 逃脱 " .. tostring(e and e.Escapes or 0))
             end)
             task.wait(0.5)
         end
@@ -6198,13 +7154,13 @@ local function buildNativeUI(pg)
         end
     end)
 
-    -- 全自动挂机 v16.10
-    makeHint(1120, "─ 全自动挂机(私服·选生存/捡箱/传天花板/领奖) ─", pageGuard, 11, Color3.fromRGB(255, 190, 90))
+    -- 全自动挂机 v16.12
+    makeHint(1120, "─ 全自动挂机(投票/生存挂机/任务模式逃脱/领奖) ─", pageGuard, 11, Color3.fromRGB(255, 190, 90))
     makeToggle(1138, "启用全自动挂机(默认关)",
         function() return G.AUTOFARM and G.AUTOFARM.Enabled or false end,
         function(v) if G.AUTOFARM then G.AUTOFARM.SetEnabled(v) end end,
         pageGuard)
-    makeToggle(1174, "自动选生存",
+    makeToggle(1174, "自动投票(逃脱优先)",
         function() return G.AUTOFARM and G.AUTOFARM.AutoVote or false end,
         function(v) if G.AUTOFARM then G.AUTOFARM.SetAutoVote(v) end end,
         pageGuard)
