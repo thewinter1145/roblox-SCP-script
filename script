@@ -2329,6 +2329,22 @@ end
 -- v16：暴露给 AUTOSKILL 模块复用「我是哪个 SCP」的权威判定
 pcall(function() G.classifySCP = classifySCP end)
 
+-- ESP 专用：这几号一律不画框（999 友好史莱姆 / 131 眼球 / 005 钥匙）
+-- 只挡「显示」；isLocalSCP / GUNBOT / 自动技能仍用原 classifySCP，行为不变
+local ESP_HIDE_NUMS = { ["999"] = true, ["131"] = true, ["005"] = true }
+local function classifyForESP(m)
+    local label = classifySCP(m)
+    if not label then return nil end
+    local n = string.match(label, "^SCP%-(%d%d+)$")
+    if n and ESP_HIDE_NUMS[n] then return nil end
+    local c = compact(label)
+    for k in pairs(ESP_HIDE_NUMS) do
+        if c == "scp" .. k then return nil end
+    end
+    return label
+end
+pcall(function() G.classifyForESP = classifyForESP end)
+
 -- 本地玩家是否 SCP（猎杀模式判定）
 -- 【v14 修复】旧版只要 Team / 属性里出现 "scp" 字样就判「自己是 SCP」，
 --   像 "SCP Foundation"（基金会人类阵营）、"SCP Personnel" 会误命中 →
@@ -2692,7 +2708,7 @@ do
                 local okPl, owner = pcall(function() return PlayersSvc:GetPlayerFromCharacter(m) end)
                 if not (okPl and owner) then destroy(m, rec) return end
             end
-            local label = classifySCP(m)
+            local label = classifyForESP(m)
             if label then
                 rec.miss = 0
                 rec.label = label
@@ -2817,7 +2833,7 @@ do
                         if crateKind(d) == "crate" then add(d, "crate") end
                     end
                     if ESP.SCPEnabled and not hunt and not isMine(d) then
-                        local label = classifySCP(d)
+                        local label = classifyForESP(d)
                         if label then add(d, "scp", label) end
                     end
                 end
@@ -2840,7 +2856,7 @@ do
                         local ch = pl.Character
                         if ch and ch ~= myChar and not isMine(ch) and not ESP.Marks[ch]
                             and not isSpectator(pl, ch) and not isInactiveBody(ch) then
-                            local sl = classifySCP(ch)
+                            local sl = classifyForESP(ch)
                             if sl then
                                 if not hunt then add(ch, "scp", sl) end
                             elseif ESP.PlayerEnabled then
@@ -2946,7 +2962,7 @@ do
                     local pl = PlayersSvc:GetPlayerFromCharacter(d)
                     if pl and pl ~= P and not ESP.Marks[d] and not isSpectator(pl, d)
                         and not isInactiveBody(d) then
-                        local sl = classifySCP(d)
+                        local sl = classifyForESP(d)
                         if sl then
                             if not ESP.HuntMode then add(d, "scp", sl) end
                         elseif ESP.PlayerEnabled then
@@ -2983,7 +2999,7 @@ do
                     if crateKind(d) == "crate" then add(d, "crate") end
                 end
                 if ESP.SCPEnabled and not ESP.HuntMode and not isMine(d) then
-                    local label = classifySCP(d)
+                    local label = classifyForESP(d)
                     if label then add(d, "scp", label) end
                 end
             end)
@@ -3627,9 +3643,9 @@ do
         CheckWall    = true,
         RespectTeam  = true,
         FromCamera   = true,       -- 已废弃：弹道与墙检固定从人物发出，仅无角色时兜底用相机
-        CheckAmmo    = true,       -- 弹匣为空时不开枪（服务端同样不结算，发包只会被丢弃）
+        CheckAmmo    = false,      -- 已停用拦截：没拿武器 / 弹匣空也照常发包（服务端自己判）
         Ammo         = nil,        -- 当前读到的弹匣数（nil = 读不到，不拦截）
-        NoAmmo       = false,      -- 上帧是否因空仓被拦
+        NoAmmo       = false,      -- 上帧是否空仓（只做提示，不再拦开枪）
         DeepScan     = false,      -- 额外全扫 workspace（默认关，省性能）
         ShowFloat    = true,       -- 手机浮动大按钮
         -- 统计 / 诊断
@@ -4073,27 +4089,24 @@ do
             B.Status = "未找到 Remotes.GunAction"
             return false
         end
-        -- 空仓不开枪：手上没枪 / 读不到弹匣时不拦截，避免误判导致整体失效
-        if B.CheckAmmo then
-            local tool = heldTool()
-            local n
-            if tool then
-                local now2 = os.clock()
-                if now2 - ammoCacheAt > 0.15 then
-                    local v = readAmmo(tool)
-                    ammoCacheAt, ammoCacheVal = now2, v
-                    n = v
-                else
-                    n = ammoCacheVal
-                end
+        -- 没拿武器 / 弹匣空 一律照常开枪（不外挂判定，交给服务端）：这里只读弹药做显示 + 顺手换弹
+        local tool = heldTool()
+        local n
+        if tool then
+            local now2 = os.clock()
+            if now2 - ammoCacheAt > 0.15 then
+                local v = readAmmo(tool)
+                ammoCacheAt, ammoCacheVal = now2, v
+                n = v
+            else
+                n = ammoCacheVal
             end
-            B.Ammo = n
-            if tool and n and n <= 0 then
-                B.NoAmmo = true
-                B.Status = "弹匣空 · 不开枪（已尝试换弹）"
-                tryReload()
-                return false
-            end
+        end
+        B.Ammo = n
+        if tool and n and n <= 0 then
+            B.NoAmmo = true
+            tryReload()                      -- 空仓也先打出去，同时后台换弹
+        else
             B.NoAmmo = false
         end
         local origin = fireOrigin()
@@ -4172,7 +4185,9 @@ do
         B.CurTarget = c.label
         if fire(c) then
             lastShot = now
+            local ammo = B.Ammo
             B.Status = "射击中 · " .. c.label
+                .. (ammo and (" · 弹" .. tostring(ammo)) or " · 无武器/弹药未知")
         end
     end
     local hbConn = RUS.Heartbeat:Connect(loop)
@@ -4258,9 +4273,6 @@ do
     -- --------------------------------------------------------
     B.SetEnabled = function(v)
         B.Enabled = v and true or false
-        B.Status = B.Enabled and "已开启" or "已关闭"
-        refreshFloat()
-        return B.Enabled
     end
     B.SetMode = function(s)
         local t = lo(s)
@@ -8660,14 +8672,17 @@ do
     }
     G.WATER_ESP = W
 
-    local NAME_HITS = { "water", "cooler", "dispenser", "fountain", "vending",
-        "soda", "coffee", "beverage", "drink", "kettle", "thermos",
-        "purifier", "aqua", "hydration", "jug", "水", "饮" }
-    local PROMPT_HITS = { "water", "drink", "dispense", "beverage", "soda",
-        "coffee", "饮水", "水", "饮料", "喝", "接水", "取水" }
+    local NAME_HITS = { "water", "cooler", "dispenser", "fountain", "drink", "水", "饮" }
+    local PROMPT_HITS = { "water", "drink", "dispense", "饮水", "水", "接水", "取水" }
+    -- 硬门槛：名字里必须真带「水」类词，或机器上有「接水/饮水/取水」按钮；
+    -- 售货机/咖啡机/SodaMachine 这类普通物件一律不标（v16.22 修误标）
+    local STRICT_PROMPT = { "water", "drink", "dispense", "饮水", "接水", "取水",
+                            "水机", "水龙头", "fountain", "dispenser", "cooler" }
     local BAD = { "door", "gate", "wall", "pipe", "wire", "cable", "effect",
         "particle", "sound", "gui", "texture", "decal", "fall", "corpse",
-        "crate", "supply", "drag", "mask", "screen" }
+        "crate", "supply", "drag", "mask", "screen",
+        "vending", "soda", "snack", "candy", "chips", "coffee", "fridge",
+        "freezer", "shelf", "microwave", "toaster", "register", "shop" }
 
     local HEAVY = Enum.Font.GothamBold
     pcall(function() HEAVY = Enum.Font.GothamBlack end)
@@ -8691,6 +8706,28 @@ do
                 .. " " .. tostring(p.Parent and p.Parent.Name)
         end)
         return hasAny(t, PROMPT_HITS)
+    end
+
+    -- 只认「真的是饮水/接水」的按钮，售货机的 Buy Drink 不算
+    local function strictPrompt(p)
+        local t = ""
+        pcall(function()
+            t = tostring(p.ActionText) .. " " .. tostring(p.ObjectText)
+                .. " " .. tostring(p.Parent and p.Parent.Name)
+        end)
+        return hasAny(t, STRICT_PROMPT)
+    end
+
+    -- 该物件内部是否有「接水类」按钮
+    local function hasWaterPrompt(o)
+        local ok, desc = pcall(function() return o:GetDescendants() end)
+        if not ok or not desc then return false end
+        for i = 1, #desc do
+            local d = desc[i]
+            local okC, isP = pcall(function() return d:IsA("ProximityPrompt") end)
+            if okC and isP and strictPrompt(d) then return true end
+        end
+        return false
     end
 
     local function anchorOf(o)
@@ -8781,7 +8818,7 @@ do
                 local okC, cls = pcall(function() return o.ClassName end)
                 if okC then
                     if cls == "ProximityPrompt" then
-                        if hitPrompt(o) then
+                        if hitPrompt(o) and strictPrompt(o) then
                             local holder
                             pcall(function()
                                 holder = o:FindFirstAncestorOfClass("Model") or o.Parent
@@ -8805,7 +8842,7 @@ do
                             for qi = 1, #NAME_HITS do
                                 if string.find(ln, NAME_HITS[qi], 1, true) then quick = true; break end
                             end
-                            if quick and not badName(nm) then
+                            if quick and not badName(nm) and hasWaterPrompt(o) then
                                 local t = nearestHitModel(o)
                                 if not found[t] then found[t] = true; foundN = foundN + 1 end
                             end
@@ -8940,30 +8977,60 @@ do
     pcall(function() HEAVY = Enum.Font.GothamBlack end)
     local OUTLINE = Color3.new(0, 0, 0)
 
-    -- 附属子部件 / 装饰后缀：不单独透视（Cup 让 294 杯子不刷屏）
+    -- 装饰后缀：不单独透视（Cup 让 294 杯子不刷屏）
     local SKIP_SUFFIX = { "Cup", "FeedScreen", "Passable", "Sinkhole", "Feed", "Screen",
                           "Dragon", "Follower", "Cable", "Conduit", "Wire" }
     local DEAD_KW     = { "corpse", "ragdoll", "dead", "remains", "oldbody", "debris" }
+
+    -- 场景/建筑词：名字里一出现就绝不标（「满墙 SCP-914」就是房间构件的名字带的）
+    local SCENE_BAD = {
+        "room", "wall", "floor", "ceil", "door", "gate", "shelf", "rack", "cabinet",
+        "locker", "light", "lamp", "window", "sign", "deco", "spawn", "zone",
+        "chamber", "area", "sector", "hall", "corridor", "pipe", "panel", "screen",
+        "button", "lever", "switch", "glass", "frame", "table", "chair", "desk",
+        "stair", "elevator", "vent", "texture", "mesh", "hitbox", "trigger",
+        "boundary", "invisible", "marker", "waypoint", "sensor", "hitbox",
+        "collision", "structure", "building", "facility", "entrance", "exit",
+        "shaft", "duct", "ceiling", "floor", "ground", "base",
+    }
+    local function hasSceneWord(nm)
+        local l = string.lower(tostring(nm or ""))
+        for i = 1, #SCENE_BAD do
+            if string.find(l, SCENE_BAD[i], 1, true) then return true end
+        end
+        return false
+    end
+
+    -- 可拾取 / 可交互（Tool，或自带互动按钮）→ 才算「道具本体」
+    local function isPropLike(o)
+        local ok, t = pcall(function() return o:IsA("Tool") end)
+        if ok and t then return true end
+        local ok2, pr = pcall(function() return o:FindFirstChildWhichIsA("ProximityPrompt", true) end)
+        return ok2 and pr ~= nil
+    end
 
     local function compact(s)
         return string.gsub(string.lower(tostring(s or "")), "[-_%s]", "")
     end
 
-    -- 从标签名解析 SCP 编号（1~4 位，保留前导零），排除附属/装饰/尸体
+    -- 标签必须「整条」就是 SCP<编号>，或只带一个已知语义后缀。
+    -- 旧版是 scp(%d+) 任意位置匹配 → SCP914Room / SCP005Shelf 全被当成道具（满屏误标根因）
+    local TAG_OK_SUFFIX = { "host", "entity", "monster", "npc", "instance",
+                            "character", "item", "tool", "pickup", "anomaly" }
     local function labelFromTag(tag)
         local c = compact(tag)
-        for _, sf in ipairs(SKIP_SUFFIX) do
-            local cs = compact(sf)
-            if cs ~= "" and (string.find(c, cs, 1, true) or string.find(cs, c, 1, true)) then
-                return nil
-            end
-        end
         for _, w in ipairs(DEAD_KW) do
             if string.find(c, w, 1, true) then return nil end
         end
-        local n = string.match(c, "scp(%d+)")
-        if not n or #n > 4 then return nil end
-        return "SCP-" .. n
+        local n = string.match(c, "^scp(%d%d%d%d?)$")
+        if n then return "SCP-" .. n end
+        local n2, sfx = string.match(c, "^scp(%d%d%d%d?)(%a+)$")
+        if n2 then
+            for _, ok in ipairs(TAG_OK_SUFFIX) do
+                if sfx == ok then return "SCP-" .. n2 end
+            end
+        end
+        return nil
     end
 
     -- 从物件名兜底解析（只认 scp+数字，避免 Room173 这类误标）
@@ -8971,30 +9038,31 @@ do
         local nm
         pcall(function() nm = o.Name end)
         if not nm then return nil end
+        if hasSceneWord(nm) then return nil end   -- 墙/柜/门/灯…一律否决
         local c = compact(nm)
         for _, w in ipairs(DEAD_KW) do
             if string.find(c, w, 1, true) then return nil end
         end
-        for _, sf in ipairs(SKIP_SUFFIX) do
-            local cs = compact(sf)
-            if #cs > 3 and string.find(c, cs, 1, true) then return nil end
+        local n, rest = string.match(c, "^scp(%d%d%d%d?)(.*)$")
+        if n then
+            -- 名字以 SCP<编号> 开头：尾巴 ≤3 字符（如 SCP005）或本身是可拾取物才算道具本体；
+            -- SCP914ControlPanel 这种长尾巴的房间构件直接丢掉
+            if #rest <= 3 or isPropLike(o) then return "SCP-" .. n end
+            return nil
         end
-        local n = string.match(c, "scp(%d%d%d%d?)")
-        if n then return "SCP-" .. n end
         -- 没有编号时按「长词」认物（只用 >=6 字符的组合词，避免 ring/spring 这类误标）
         local MAP = {
             { "pizzabox",     "SCP-458" },
             { "infinitepizza","SCP-458" },
-            { "coffeemachine", "SCP-294" },
-            { "vendingmachine","SCP-294" },
-            { "sodamachine",  "SCP-294" },
             { "candybowl",    "SCP-330" },
             { "panacea",      "SCP-500" },
             { "medicalbook",  "SCP-1025" },
             { "jadering",     "SCP-714" },
         }
         for _, kv in ipairs(MAP) do
-            if string.find(c, kv[1], 1, true) then return kv[2] end
+            if string.find(c, kv[1], 1, true) then
+                if isPropLike(o) or #c <= 22 then return kv[2] end
+            end
         end
         return nil
     end
@@ -9021,8 +9089,49 @@ do
         if not ok or not inst.Parent then pcall(function() inst.Parent = WS end) end
     end
 
+    local function posOf(o)
+        local p
+        pcall(function()
+            if o:IsA("BasePart") then p = o.Position else p = o:GetPivot().Position end
+        end)
+        return p
+    end
+
+    -- 按编号建索引，去重只比对同编号的少数几个（不做全表遍历）
+    ESP.labelIndex = ESP.labelIndex or {}
+    local function indexAdd(label, o)
+        local g = ESP.labelIndex[label]
+        if not g then g = {}; ESP.labelIndex[label] = g end
+        g[#g + 1] = o
+    end
+    local function indexDel(label, o)
+        local g = ESP.labelIndex[label]
+        if not g then return end
+        for i = #g, 1, -1 do
+            if g[i] == o then table.remove(g, i) end
+        end
+        if #g == 0 then ESP.labelIndex[label] = nil end
+    end
+
+    -- 同一编号、相距 < 12 studs → 视为同一个物件的多个部件，只留一个标签
+    local function nearDuplicate(o, label)
+        local g = ESP.labelIndex[label]
+        if not g or #g == 0 then return false end
+        local p = posOf(o)
+        if not p then return false end
+        for i = 1, #g do
+            local m = g[i]
+            if m ~= o and m.Parent then
+                local p2 = posOf(m)
+                if p2 and (p2 - p).Magnitude < 12 then return true end
+            end
+        end
+        return false
+    end
+
     local function addMark(o, label, src)
         if ESP.Marked[o] then return end
+        if nearDuplicate(o, label) then return end
         local bg = Instance.new("BillboardGui")
         bg.Name = "NS_BB"
         bg.Adornee = o
@@ -9044,18 +9153,36 @@ do
         tl.Text = label
         tl.Parent = bg
         ESP.Marked[o] = { bg = bg, tl = tl, label = label, applied = label, src = src or "tag" }
+        indexAdd(label, o)
     end
 
     local function delMark(o)
         local r = ESP.Marked[o]
         if not r then return end
         pcall(function() r.bg:Destroy() end)
+        indexDel(r.label, o)
         ESP.Marked[o] = nil
     end
 
     local function isLiving(o)
         local ok, h = pcall(function() return o:FindFirstChildOfClass("Humanoid") end)
         return ok and h ~= nil
+    end
+
+    -- 统一门槛：带场景词的一律不标；非道具只接受「名字本身就是 SCP<编号>」
+    local HIDE_NUMS = { ["999"] = true, ["131"] = true, ["005"] = true }
+    local function acceptable(o, label)
+        local num = string.match(tostring(label or ""), "^SCP%-(%d%d+)$")
+        if num and HIDE_NUMS[num] then return false end
+        local nm
+        pcall(function() nm = o.Name end)
+        nm = tostring(nm or "")
+        if hasSceneWord(nm) then return false end
+        if isPropLike(o) then return true end
+        local c = compact(nm)
+        local n, rest = string.match(c, "^scp(%d%d%d%d?)(.*)$")
+        if not n or #rest > 3 then return false end
+        return ("SCP-" .. n) == label
     end
 
     -- 标签来源：取该对象所有 SCP 标签里第一个有效编号
@@ -9069,11 +9196,12 @@ do
         pcall(function() tags = CS:GetTags(o) end)
         for _, t in ipairs(tags) do
             local label = labelFromTag(t)
-            if label then addMark(o, label); return end
+            if label and acceptable(o, label) then addMark(o, label); return end
         end
         local okV, v = pcall(function() return o:GetAttribute("SCP") end)
         if okV and v ~= nil then
-            addMark(o, "SCP-" .. tostring(v))
+            local lb = "SCP-" .. tostring(v)
+            if acceptable(o, lb) then addMark(o, lb) end
         end
     end
 
@@ -9132,23 +9260,6 @@ do
                                     hit = hit + 1
                                 end
                             end
-                        end
-                    end
-                elseif cls == "ProximityPrompt" then
-                    -- 按钮文案兜底：「Use SCP-458 Pizza Box」这类
-                    local txt = ""
-                    pcall(function()
-                        txt = tostring(o.ActionText) .. " " .. tostring(o.ObjectText)
-                    end)
-                    local num = string.match(compact(txt), "scp(%d%d%d%d?)")
-                    if num then
-                        local holder
-                        pcall(function()
-                            holder = o:FindFirstAncestorOfClass("Model") or o.Parent
-                        end)
-                        if holder and not ESP.Marked[holder] and not isLiving(holder) then
-                            addMark(holder, "SCP-" .. num, "name")
-                            hit = hit + 1
                         end
                     end
                 end
@@ -9212,6 +9323,8 @@ do
     ESP.Off = function()
         ESP.Enabled = false
         for o in pairs(ESP.Marked) do delMark(o) end
+        ESP.Marked = {}
+        ESP.labelIndex = {}
         ESP.Status = "已关闭"
         return false
     end
@@ -9262,6 +9375,19 @@ local function buildObsidianUI(Library)
                     G.CRATE_ESP[key .. "Enabled"] = v
                     G.CRATE_ESP.Reconcile()
                 end
+                -- SCP透视 就是总闸：饮水机 + 新SCP 物件一并跟随，不再单独列表
+                if key == "SCP" then
+                    pcall(function() if G.WATER_ESP and G.WATER_ESP.SetEnabled then G.WATER_ESP.SetEnabled(v) end end)
+                    pcall(function()
+                        local N = G.NEWSCP_ESP
+                        if not N then return end
+                        if v then
+                            if N.On then N.On() elseif N.SetEnabled then N.SetEnabled(true) end
+                        else
+                            if N.Off then N.Off() elseif N.SetEnabled then N.SetEnabled(false) end
+                        end
+                    end)
+                end
                 Library:Notify(text .. (v and " 已开启" or " 已关闭"), 2)
             end,
         })
@@ -9270,24 +9396,7 @@ local function buildObsidianUI(Library)
     addToggle("Player", "玩家透视")
     addToggle("Gun", "武器透视")
     addToggle("Crate", "物资箱透视")
-    GB:AddToggle("espWater", {
-        Text = "饮水机透视", Default = true,
-        Tooltip = "水机/饮水机/饮料机：名字或互动按钮含 water/drink/饮料/饮水 的物件；SCP-294 标为「饮料机」",
-        Callback = function(v)
-            if G.WATER_ESP then G.WATER_ESP.SetEnabled(v) end
-            Library:Notify("饮水机透视 " .. (v and "已开启" or "已关闭"), 2)
-        end,
-    })
-    GB:AddToggle("espNewScp", {
-        Text = "新SCP透视（全编号）", Default = true,
-        Tooltip = "标签或物件名含 SCP 编号的非角色物件：294 饮料机 / 458 披萨盒 / 500 药 / 714 玉戒 / 1025 医学百科…（角色型仍由上面的 SCP透视 负责）",
-        Callback = function(v)
-            if G.NEWSCP_ESP then
-                if v then pcall(G.NEWSCP_ESP.On) else pcall(G.NEWSCP_ESP.Off) end
-            end
-            Library:Notify("新SCP透视 " .. (v and "已开启" or "已关闭"), 2)
-        end,
-    })
+    -- 饮水机 / 饮料机 / 新SCP 物件（294 咖啡机、458 披萨盒、500 药…）已并入上面的「SCP透视」总开关
 
     -- 子项：透视同样受「SCP透视」总开关约束
     -- 徽章NPC：统一交给 STAFFHUNT v1.3（昨天的版本，判据更准 + 自带自动传送）
@@ -9310,15 +9419,6 @@ local function buildObsidianUI(Library)
             Library:Notify("徽章NPC自动传送 " .. (v and "已开启" or "已关闭"), 2)
         end,
     })
-    GB:AddToggle("esp610anti", {
-        Text = "610防护（防感染）", Default = true,
-        Tooltip = "清零 SCP610Infection / 摘除自身感染标签",
-        Callback = function(v)
-            if G.SCP610_DEF then G.SCP610_DEF.SetAnti(v) end
-            Library:Notify("610防护 " .. (v and "已开启" or "已关闭"), 2)
-        end,
-    })
-
     local GB2 = TabMain:AddLeftGroupbox("说明", "info")
     GB2:AddLabel("SCP 统一红色 · 人类统一绿色")
     GB2:AddLabel("判定沿用原始脚本的队伍/属性逻辑")
@@ -9581,6 +9681,30 @@ local function buildObsidianUI(Library)
                 setLbl(g294st, "状态：" .. tostring(d.Status) .. " · 显示 " .. tostring(d.Shown) .. " 次 · " .. tostring(d.Last))
             end)
             task.wait(0.5)
+        end
+    end)
+
+    -- ===== 610 防护（防护栏 · 从主要页搬来）=====
+    local G610 = TabGuard:AddLeftGroupbox("610 防护", "shield")
+    G610:AddToggle("esp610anti", {
+        Text = "610防护（防感染）", Default = true,
+        Tooltip = "清零 SCP610Infection / 摘除自身 610 宿主标签；610 透视仍由「主要 → SCP透视」统一负责",
+        Callback = function(v)
+            if G.SCP610_DEF then G.SCP610_DEF.SetAnti(v) end
+            Library:Notify("610防护 " .. (v and "已开启" or "已关闭"), 2)
+        end,
+    })
+    local g610st = G610:AddLabel("状态：待命")
+    G610:AddLabel("防感染 · 宿主标签自动摘除")
+    task.spawn(function()
+        while G.SCP610_DEF do
+            pcall(function()
+                local d = G.SCP610_DEF
+                setLbl(g610st, "状态：" .. (d.AntiInfect and "开" or "关")
+                    .. " · 清零 " .. tostring(d.ClampCount or 0)
+                    .. " · 摘签 " .. tostring(d.HostRemoveCount or 0))
+            end)
+            task.wait(0.6)
         end
     end)
 
@@ -10155,7 +10279,22 @@ local function buildNativeUI(pg)
     for _, f in ipairs(flags) do
         makeToggle(y, f.text,
             function() return G.CRATE_ESP and G.CRATE_ESP[f.key] or false end,
-            function(v) if G.CRATE_ESP then G.CRATE_ESP[f.key] = v end end,
+            function(v)
+                if G.CRATE_ESP then G.CRATE_ESP[f.key] = v end
+                -- SCP透视 是总闸：饮水机 + 新SCP物件一起跟随
+                if f.key == "SCPEnabled" then
+                    pcall(function() if G.WATER_ESP and G.WATER_ESP.SetEnabled then G.WATER_ESP.SetEnabled(v) end end)
+                    pcall(function()
+                        local N = G.NEWSCP_ESP
+                        if not N then return end
+                        if v then
+                            if N.On then N.On() elseif N.SetEnabled then N.SetEnabled(true) end
+                        else
+                            if N.Off then N.Off() elseif N.SetEnabled then N.SetEnabled(false) end
+                        end
+                    end)
+                end
+            end,
             pageMain)
         y = y + 38
     end
@@ -10216,10 +10355,6 @@ local function buildNativeUI(pg)
             if G.STAFF_ESP then pcall(function() G.STAFF_ESP.SetUserEnabled(false) end) end
         end,
         pageMain)
-    local row610 = makeToggle(550, "610 防护（防感染）",
-        function() return G.SCP610_DEF and G.SCP610_DEF.AntiInfect or false end,
-        function(v) if G.SCP610_DEF then G.SCP610_DEF.SetAnti(v) end end,
-        pageMain)
     local rowAutoTP = makeToggle(586, "徽章NPC自动传送",
         function()
             if G.STAFFHUNT then return G.STAFFHUNT.AutoTP end
@@ -10235,17 +10370,15 @@ local function buildNativeUI(pg)
     task.spawn(function()
         while gui.Parent do
             pcall(function()
-                local SE, SD = G.STAFF_ESP, G.SCP610_DEF
+                local SE = G.STAFF_ESP
                 local on = G.CRATE_ESP and G.CRATE_ESP.SCPEnabled
-                espSubSt.Text = string.format("总开关:%s · 徽章:%s · 610:%s · 传送:%s%s",
+                espSubSt.Text = string.format("总开关:%s · 徽章:%s · 传送:%s%s",
                     on and "开" or "关",
                     SE and (SE.CFG.Enabled and "显示" or "停") or "-",
-                    SD and (SD.AntiInfect and "防护开" or "防护关") or "-",
                     SE and (SE.CFG.AutoTP and "开" or "关") or "-",
                     (SE and SE.State and SE.State.why) and ("(" .. SE.State.why .. ")") or "")
                 -- 总开关变化时把按钮显示拉回真实状态
                 if rowStaff.Sync then rowStaff.Sync() end
-                if row610.Sync then row610.Sync() end
                 if rowAutoTP.Sync then rowAutoTP.Sync() end
             end)
             task.wait(0.5)
@@ -10421,6 +10554,12 @@ local function buildNativeUI(pg)
     makeButton(736, "清零 173 计数", pageGuard, Color3.fromRGB(40, 90, 140), function()
         if G.GUARD173 then G.GUARD173.ResetCount() end
     end)
+    -- 610 防护（从主要页搬到防护页）
+    makeToggle(766, "610 防护（防感染）",
+        function() return G.SCP610_DEF and G.SCP610_DEF.AntiInfect or false end,
+        function(v) if G.SCP610_DEF then G.SCP610_DEF.SetAnti(v) end end,
+        pageGuard)
+
     task.spawn(function()
         while gui.Parent and G.GUARD173 do
             pcall(function()
@@ -10454,8 +10593,8 @@ local function buildNativeUI(pg)
     end)
 
     -- 自动开门 v16.6
-    makeHint(766, "─ 自动开门（门前直开·免碰按钮）─", pageGuard, 11, Color3.fromRGB(120, 210, 255))
-    makeToggle(784, "门前自动开门(默认关)",
+    makeHint(800, "─ 自动开门（门前直开·免碰按钮）─", pageGuard, 11, Color3.fromRGB(120, 210, 255))
+    makeToggle(818, "门前自动开门(默认关)",
         function() return G.AUTODOOR and G.AUTODOOR.Enabled or false end,
         function(v) if G.AUTODOOR then G.AUTODOOR.SetEnabled(v) end end,
         pageGuard)
@@ -10780,7 +10919,7 @@ do
     pcall(function() HEAVY = Enum.Font.GothamBlack end)
     local OUTLINE = Color3.new(0, 0, 0)
 
-    local EXCLUDE = { ["999"] = true, ["131"] = true, ["106"] = true }
+    local EXCLUDE = { ["999"] = true, ["131"] = true, ["106"] = true, ["005"] = true }
     local SKIP_SUFFIX = { "Cup", "FeedScreen", "Passable", "Sinkhole", "Feed", "Screen",
                           "Dragon", "Follower", "Cable", "Conduit", "Wire" }
     local DEAD_KW = { "corpse", "ragdoll", "dead", "remains", "oldbody", "debris" }
