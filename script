@@ -1,5 +1,5 @@
 -- SCP 透视助手（黑曜石开源原本优先 · 原生面板兜底 · 队伍/属性判定 · 精简重写版）
--- 栏位：主要(透视/无限体力) · 防护(096/035/106/173 + 计数) · 攻击(GunAction 自动射击)
+-- 栏位：主要(透视/无限体力) · 防护(096/035/106/173 + 计数) · rage(总开关/命中反馈/弹道显示/队伍检测/攻击)
 -- 判定逻辑：复用原始 classifySCP / isLocalSCP；增强「真人操控 SCP」识别
 --   玩家角色只认 Class/Controller/玩家属性/Team 等权威字段，绝不靠昵称；
 --   真人操控的 SCP 标红并显示 SCP-编号 ["用户名"操控]；035 旧身体 / SCP 尸体不再透视
@@ -161,14 +161,25 @@ local function isGhostSpec(pl)
     local ok2, tagged = pcall(function() return CS_SPEC:HasTag(ch, "Ghost") end)
     if ok2 and tagged == true then return true end
     -- ④ Humanoid 状态 / 不在工作区（观战容器、Lobby、死亡）
+    -- 【v16.5 关键修复】旧版这里写了 Enum.HumanoidStateType.Spectating，
+    --   但当前 Roblox 根本没有这个枚举成员 → 表达式直接抛错，
+    --   而 isSpectator / fullScan 外层是 pcall → 玩家那一段整体被中断，
+    --   结果就是「玩家透视怎么开都没用」，连带自动射击的目标筛选一起失效。
+    --   现在只比较 Dead，且整段比较包 pcall，缺枚举也不会再炸。
     local okH, hum = pcall(function() return ch:FindFirstChildOfClass("Humanoid") end)
     if okH and hum then
         local okS, st = pcall(function() return hum:GetState() end)
-        if okS and (st == Enum.HumanoidStateType.Dead
-                 or st == Enum.HumanoidStateType.Spectating) then return true end
+        if okS and st then
+            local okD, dead = pcall(function() return st == Enum.HumanoidStateType.Dead end)
+            if okD and dead then return true end
+        end
     end
     local okP, par = pcall(function() return ch.Parent end)
-    if okP and par ~= workspace then return true end
+    if okP and par then
+        local okW, inWS = pcall(function() return ch:IsDescendantOf(workspace) end)
+        -- 只在确实不在工作区时才算旁观；角色挂在 Workspace 的子文件夹里也算在场
+        if okW and not inWS then return true end
+    end
     return false
 end
 
@@ -2367,9 +2378,10 @@ do
         CrateEnabled = false, SCPEnabled = true, GunEnabled = false, PlayerEnabled = false,
         Marks = {}, HuntMode = false, ForceHunt = nil,
         RefreshInterval = 0.6, RecheckInterval = 1.5,
-        HuntCheckInterval = 3.0, FullScanInterval = 8.0,
+        HuntCheckInterval = 3.0, FullScanInterval = 12.0,   -- 兜底全扫；新对象走 DescendantAdded
     }
     G.CRATE_ESP = ESP
+    local CSvc = game:GetService("CollectionService")
 
     local function isMine(m)
         if m == (P and P.Character) then return true end
@@ -2381,7 +2393,8 @@ do
     local function isSpectator(pl, ch)
         if not pl then return false end
         -- 本游戏旁观者：角色带 "Ghost" 标签（Class=nil）→ 直接判定为旁观者
-        if isGhostSpec(pl) then return true end
+        local okG, isGhost = pcall(isGhostSpec, pl)
+        if okG and isGhost then return true end
         local okT, team = pcall(function() return pl.Team end)
         if okT and team then
             local n = string.lower(tostring(team.Name))
@@ -2871,22 +2884,34 @@ do
         for _, e in ipairs(list) do
             if e.rec.bg.Enabled ~= true then e.rec.bg.Enabled = true end
         end
-        for i = 1, #list do
-            for j = i + 1, #list do
-                local A, B = list[i], list[j]
-                if A.label and B.label and A.label == B.label
-                    and (A.pos - B.pos).Magnitude < DEDUP_R then
-                    local far = (A.d >= B.d) and A or B
-                    if far.rec.bg.Enabled then far.rec.bg.Enabled = false end
+        -- 按编号分桶：只在同名组内两两比较（原来是全表 O(n²)）
+        local bucket = {}
+        for _, e in ipairs(list) do
+            if e.label then
+                local g = bucket[e.label]
+                if not g then g = {}; bucket[e.label] = g end
+                g[#g + 1] = e
+            end
+        end
+        for _, g in pairs(bucket) do
+            if #g > 1 then
+                for i = 1, #g do
+                    for j = i + 1, #g do
+                        local A, B = g[i], g[j]
+                        if (A.pos - B.pos).Magnitude < DEDUP_R then
+                            local far = (A.d >= B.d) and A or B
+                            if far.rec.bg.Enabled then far.rec.bg.Enabled = false end
+                        end
+                    end
                 end
             end
         end
     end
 
-    local acc, sacc, hacc, facc = 0, 0, 0, 0
+    local acc, sacc, hacc, facc, dacc = 0, 0, 0, 0, 0
     ESP.Heartbeat = RUS.Heartbeat:Connect(function(dt)
         if not ESP.Enabled then return end
-        acc = acc + dt;sacc = sacc + dt;hacc = hacc + dt;facc = facc + dt
+        acc = acc + dt;sacc = sacc + dt;hacc = hacc + dt;facc = facc + dt;dacc = dacc + dt
         if hacc >= ESP.HuntCheckInterval then
             hacc = 0
             ESP.HuntMode = isLocalSCP()
@@ -2900,13 +2925,21 @@ do
             local slow = sacc >= ESP.RecheckInterval
             if slow then sacc = 0 end
             for m, rec in pairs(ESP.Marks) do pcall(refresh, m, rec, slow) end
-            pcall(dedupeSCPLabels)
+            -- 去重要算包围盒，别跟着 0.6s 跑：2s 一次足够，肉眼无差
+            if dacc >= 2 then
+                dacc = 0
+                pcall(dedupeSCPLabels)
+            end
         end
     end)
 
     ESP.Added = WS.DescendantAdded:Connect(function(d)
         if not ESP.Enabled or not d:IsA("Model") then return end
-        if ESP.PlayerEnabled or ESP.SCPEnabled then
+        if ESP.Marks[d] then return end
+        -- 廉价预筛：非玩家角色不排队（地图装饰 Model 在进图瞬间有几千个）
+        local plNow
+        pcall(function() plNow = PlayersSvc:GetPlayerFromCharacter(d) end)
+        if plNow and (ESP.PlayerEnabled or ESP.SCPEnabled) then
             task.defer(function()
                 pcall(function()
                     if not ESP.Enabled or not (ESP.PlayerEnabled or ESP.SCPEnabled) then return end
@@ -2924,10 +2957,25 @@ do
             end)
         end
         local ln = string.lower(d.Name)
-        if not (string.find(ln, "crate", 1, true) or string.find(ln, "scp", 1, true)
-                or string.find(ln, "dropped", 1, true) or string.find(ln, "supply", 1, true)
-                or string.find(ln, "682", 1, true) or string.find(ln, "173", 1, true)
-                or string.find(ln, "096", 1, true)) then return end
+        local maybe = string.find(ln, "scp", 1, true) ~= nil
+        if not maybe then
+            for _, w in ipairs({ "crate", "dropped", "supply", "682", "173", "096",
+                                 "049", "106", "035", "939", "999", "966", "457",
+                                 "079", "066", "076", "008", "610", "131", "777" }) do
+                if string.find(ln, w, 1, true) then maybe = true; break end
+            end
+        end
+        if not maybe then
+            -- 再查一次标签（名字不含编号但带 SCP 标签的 NPC）
+            pcall(function()
+                for _, t in ipairs(CSvc:GetTags(d)) do
+                    if string.find(string.lower(tostring(t)), "scp", 1, true) then
+                        maybe = true; break
+                    end
+                end
+            end)
+        end
+        if not maybe then return end
         task.defer(function()
             pcall(function()
                 if not ESP.Enabled then return end
@@ -3046,6 +3094,502 @@ end
 -- ============================================================
 
 -- ============================================================
+-- rage · 命中反馈 / 弹道显示（纯客户端视觉 · 零 hook · 零元表）
+-- 触发：GUNBOT 每次成功发包后调用 G.RAGE_FX.play(起点, 命中点, 目标Model)
+-- 对外：G.RAGE_FX.SetHit(bool) / SetTracer(bool) / SetEnabled(bool) / Dump()
+-- ============================================================
+do
+    local TweenService = game:GetService("TweenService")
+    local SoundService = game:GetService("SoundService")
+    local RunSvc       = game:GetService("RunService")
+    local Players      = game:GetService("Players")
+
+    local FX = {
+        Enabled     = true,
+        Hitmarker   = false,   -- 「命中反馈」：命中标记 + 边缘闪光 + FOV 冲击 + 音效 + 目标高亮
+        Tracer      = false,   -- 「弹道显示」：从人物（头部/身体）画到命中点
+        TracerStyle = "经典",  -- 弹道样式：经典 / 粗光晕 / 细针 / 3D 光束 / 3D 脉冲
+        Effect      = true,
+        SoundOn     = true,
+        Chams       = true,
+        SoundKey    = "Skeet",
+        Volume      = 0.7,
+        TracerColor = Color3.fromRGB(0, 200, 255),
+        TracerLife  = 0.18,
+        TracerWidth = 1.5,
+        ChamsColor  = Color3.fromRGB(255, 255, 255),
+        ChamsLife   = 0.6,
+    }
+    G.RAGE_FX = FX
+
+    local Tween = TweenInfo.new
+
+    local HITSOUNDS = {
+        ['Skeet']     = 'rbxassetid://5633695679',
+        ['Neverlose'] = 'rbxassetid://6534948092',
+        ['Bameware']  = 'rbxassetid://3124331820',
+        ['Pick']      = 'rbxassetid://1347140027',
+    }
+
+    -- ---------- 容器 ----------
+    pcall(function()
+        local lp = Players.LocalPlayer
+        local pg = lp and lp:FindFirstChildOfClass("PlayerGui")
+        local o = pg and pg:FindFirstChild("RageFX")
+        if o then o:Destroy() end
+    end)
+
+    local fxGui = Instance.new("ScreenGui")
+    fxGui.Name = "RageFX"
+    fxGui.IgnoreGuiInset = true
+    fxGui.ResetOnSpawn = false
+    fxGui.DisplayOrder = 500
+    local okParent = pcall(function()
+        fxGui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+    end)
+    if not okParent or not fxGui.Parent then
+        pcall(function()
+            local lp = Players.LocalPlayer
+            local pg = lp and lp:FindFirstChildOfClass("PlayerGui")
+            if pg then fxGui.Parent = pg end
+        end)
+    end
+    FX.Gui = fxGui
+
+    -- ---------- 命中标记（对象池 · 四条斜线内收再外散）----------
+    local POOL = 4
+    local HM_RESET = {
+        UDim2.new(0.5, -20, 0.5, -20), UDim2.new(0.5, 20, 0.5, -20),
+        UDim2.new(0.5, -20, 0.5, 20),  UDim2.new(0.5, 20, 0.5, 20),
+    }
+    local HM_ENTER = {
+        UDim2.new(0.5, -12, 0.5, -12), UDim2.new(0.5, 12, 0.5, -12),
+        UDim2.new(0.5, -12, 0.5, 12),  UDim2.new(0.5, 12, 0.5, 12),
+    }
+    local HM_EXIT = {
+        UDim2.new(0.5, -18, 0.5, -18), UDim2.new(0.5, 18, 0.5, -18),
+        UDim2.new(0.5, -18, 0.5, 18),  UDim2.new(0.5, 18, 0.5, 18),
+    }
+    local CORNER_ROT = { 45, -45, -45, 45 }
+    local CORNER_POS = {
+        { 0.5, -14, 0.5, -14 }, { 0.5, 14, 0.5, -14 },
+        { 0.5, -14, 0.5, 14 },  { 0.5, 14, 0.5, 14 },
+    }
+
+    local pool = {}
+    for _ = 1, POOL do
+        local f = Instance.new("Frame")
+        f.Size = UDim2.fromOffset(60, 60)
+        f.AnchorPoint = Vector2.new(0.5, 0.5)
+        f.Position = UDim2.new(0.5, 0, 0.5, 0)
+        f.BackgroundTransparency = 1
+        f.Visible = false
+        f.ZIndex = 300
+        f.Parent = fxGui
+        local parts = {}
+        for i = 1, 4 do
+            local line = Instance.new("Frame")
+            line.Size = UDim2.fromOffset(14, 2)
+            line.AnchorPoint = Vector2.new(0.5, 0.5)
+            line.Position = UDim2.new(CORNER_POS[i][1], CORNER_POS[i][2],
+                CORNER_POS[i][3], CORNER_POS[i][4])
+            line.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+            line.BorderSizePixel = 0
+            line.Rotation = CORNER_ROT[i]
+            line.BackgroundTransparency = 1
+            line.ZIndex = 301
+            line.Parent = f
+            local st = Instance.new("UIStroke")
+            st.Color = Color3.new(0, 0, 0)
+            st.Thickness = 1
+            st.Transparency = 1
+            st.Parent = line
+            parts[i] = { line = line, stroke = st }
+        end
+        pool[#pool + 1] = { frame = f, parts = parts, token = 0 }
+    end
+    local poolIdx = 0
+
+    local function hitmarker()
+        poolIdx = poolIdx % POOL + 1
+        local hm = pool[poolIdx]
+        hm.token = hm.token + 1
+        local tok = hm.token
+
+        hm.frame.Visible = true
+        for i = 1, 4 do
+            local p = hm.parts[i]
+            p.line.Position = HM_ENTER[i]
+            p.line.BackgroundTransparency = 0
+            p.stroke.Transparency = 0.25
+            TweenService:Create(p.line, Tween(0.06, Enum.EasingStyle.Quad,
+                Enum.EasingDirection.Out), { Position = HM_RESET[i] }):Play()
+        end
+
+        task.delay(0.1, function()
+            if hm.token ~= tok then return end
+            for i = 1, 4 do
+                local p = hm.parts[i]
+                TweenService:Create(p.line, Tween(0.12, Enum.EasingStyle.Quad,
+                    Enum.EasingDirection.Out), {
+                    Position = HM_EXIT[i],
+                    BackgroundTransparency = 1,
+                }):Play()
+                TweenService:Create(p.stroke, Tween(0.12), { Transparency = 1 }):Play()
+            end
+            task.delay(0.14, function()
+                if hm.token == tok then hm.frame.Visible = false end
+            end)
+        end)
+    end
+
+    -- ---------- 屏幕边缘闪光 ----------
+    local EDGE_ALPHA = 0.26
+    local edges = {}
+    local function makeEdge(size, pos, rot, reverse)
+        local e = Instance.new("Frame")
+        e.Size = size
+        e.Position = pos
+        e.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        e.BackgroundTransparency = 1
+        e.BorderSizePixel = 0
+        e.ZIndex = 280
+        e.Visible = false
+        e.Parent = fxGui
+        local g = Instance.new("UIGradient")
+        g.Rotation = rot
+        g.Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, reverse and 1 or 0),
+            NumberSequenceKeypoint.new(0.72, 0.45),
+            NumberSequenceKeypoint.new(1, reverse and 0 or 1),
+        })
+        g.Parent = e
+        return e
+    end
+    edges[1] = makeEdge(UDim2.new(1, 0, 0, 96), UDim2.new(0, 0, 0, 0), 90, false)
+    edges[2] = makeEdge(UDim2.new(1, 0, 0, 96), UDim2.new(0, 0, 1, -96), 90, true)
+    edges[3] = makeEdge(UDim2.new(0, 96, 1, -192), UDim2.new(0, 0, 0, 96), 0, false)
+    edges[4] = makeEdge(UDim2.new(0, 96, 1, -192), UDim2.new(1, -96, 0, 96), 0, true)
+
+    local edgeToken = 0
+    local function flash()
+        edgeToken = edgeToken + 1
+        local tok = edgeToken
+        for _, e in ipairs(edges) do
+            e.Visible = true
+            e.BackgroundTransparency = math.min(1, EDGE_ALPHA + 0.08)
+            TweenService:Create(e, Tween(0.025, Enum.EasingStyle.Quad,
+                Enum.EasingDirection.Out), { BackgroundTransparency = EDGE_ALPHA }):Play()
+        end
+        task.delay(0.08, function()
+            if edgeToken ~= tok then return end
+            for _, e in ipairs(edges) do
+                local t = TweenService:Create(e, Tween(1.0, Enum.EasingStyle.Quad,
+                    Enum.EasingDirection.Out), { BackgroundTransparency = 1 })
+                t.Completed:Connect(function()
+                    if edgeToken == tok then e.Visible = false end
+                end)
+                t:Play()
+            end
+        end)
+    end
+
+    -- ---------- FOV 冲击 ----------
+    local fovBase, fovTween, fovToken, fovT0 = nil, nil, 0, 0
+    local function fovPunch()
+        local cam = workspace.CurrentCamera
+        if not cam then return end
+        -- 连发不叠加：上一发冲击（含 1s 回落）没走完就直接跳过，避免 FOV 漂移
+        if fovTween and (tick() - fovT0) < 1.2 then return end
+        fovT0 = tick()
+        fovToken = fovToken + 1
+        local tok = fovToken
+        if not fovBase then fovBase = cam.FieldOfView end
+        if fovTween then pcall(function() fovTween:Cancel() end) end
+        fovTween = TweenService:Create(cam, Tween(0.028, Enum.EasingStyle.Quad,
+            Enum.EasingDirection.Out), { FieldOfView = math.min(120, fovBase + 3.5) })
+        fovTween:Play()
+        task.delay(0.045, function()
+            if fovToken ~= tok or not cam.Parent or not fovBase then return end
+            if fovTween then pcall(function() fovTween:Cancel() end) end
+            fovTween = TweenService:Create(cam, Tween(1.0, Enum.EasingStyle.Quad,
+                Enum.EasingDirection.Out), { FieldOfView = fovBase })
+            fovTween:Play()
+            fovTween.Completed:Connect(function()
+                if fovToken == tok then fovTween = nil; fovBase = nil end
+            end)
+        end)
+    end
+
+    -- ---------- 音效 ----------
+    local function playSound()
+        if not FX.SoundOn then return end
+        -- 连发节流：0.05s 内只响一次，避免 12 发/秒叠成噪音
+        local nowT = tick()
+        if nowT - (FX._lastSnd or 0) < 0.05 then return end
+        FX._lastSnd = nowT
+        local id = HITSOUNDS[FX.SoundKey] or HITSOUNDS['Skeet']
+        local s = Instance.new("Sound")
+        s.SoundId = id
+        s.Volume = FX.Volume or 0.7
+        s.PlaybackSpeed = 0.96 + math.random() * 0.08
+        s.Parent = SoundService
+        local ok = pcall(function() s:Play() end)
+        if not ok then pcall(function() s:Destroy() end) return end
+        s.Ended:Connect(function() pcall(function() s:Destroy() end) end)
+        task.delay(3, function() pcall(function() if s.Parent then s:Destroy() end end) end)
+    end
+
+    -- ---------- 命中目标短暂高亮 ----------
+    local chamFolder = Instance.new("Folder")
+    chamFolder.Name = "RageHitChams"
+    chamFolder.Parent = fxGui
+
+    local lastChams = {}
+    local lastChamsN = 0
+    local function hitChams(char)
+        if not (FX.Chams and char) then return end
+        -- 同一目标 1s 内只高亮一次，连发时不堆 Highlight
+        local nowC = tick()
+        if lastChams[char] and nowC - lastChams[char] < 1.0 then return end
+        if lastChamsN > 200 then lastChams = {}; lastChamsN = 0 end
+        lastChams[char] = nowC
+        lastChamsN = lastChamsN + 1
+        local ok, hl = pcall(function()
+            local h = Instance.new("Highlight")
+            h.Adornee = char
+            h.FillColor = FX.ChamsColor or Color3.fromRGB(255, 255, 255)
+            h.OutlineColor = FX.ChamsColor or Color3.fromRGB(255, 255, 255)
+            h.FillTransparency = 0.55
+            h.OutlineTransparency = 0
+            h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+            h.Parent = chamFolder
+            return h
+        end)
+        if not ok or not hl then return end
+        local life = FX.ChamsLife or 0.6
+        task.delay(life, function()
+            if not hl.Parent then return end
+            local t0 = tick()
+            local conn
+            conn = RunSvc.Heartbeat:Connect(function()
+                local a = math.clamp((tick() - t0) / 0.35, 0, 1)
+                hl.FillTransparency = 0.55 + 0.45 * a
+                hl.OutlineTransparency = a
+                if a >= 1 then
+                    conn:Disconnect()
+                    pcall(function() hl:Destroy() end)
+                end
+            end)
+        end)
+    end
+
+    -- ---------- 弹道 ----------
+    local TRACER_POOL = 32
+    local tracers = {}
+    local hasDrawing = (typeof(Drawing) == "table" and Drawing.new ~= nil)
+
+    local beamFolder = Instance.new("Folder")
+    beamFolder.Name = "RageBeam"
+    pcall(function() beamFolder.Parent = workspace.CurrentCamera or workspace end)
+
+    local function drawBeam3D(a, b)
+        local okD, mag = pcall(function() return (b - a).Magnitude end)
+        if not okD or not mag or mag < 0.5 then return end
+        local a0 = Instance.new("Attachment")
+        a0.CFrame = CFrame.new(a)
+        a0.Parent = beamFolder
+        local a1 = Instance.new("Attachment")
+        a1.CFrame = CFrame.new(b)
+        a1.Parent = beamFolder
+        local beam = Instance.new("Beam")
+        beam.Attachment0 = a0
+        beam.Attachment1 = a1
+        beam.FaceCamera = true
+        beam.LightEmission = 1
+        beam.LightInfluence = 1
+        beam.Color = ColorSequence.new(FX.TracerColor)
+        beam.Transparency = NumberSequence.new(0)
+        local style = FX.TracerStyle or "经典"
+        local w0 = math.max((FX.TracerWidth or 1.5) * 0.06, 0.03)
+        if style == "3D 脉冲" then
+            -- 无纹理纯光柱：靠宽度与透明度做呼吸感
+            beam.Texture = ""
+            beam.TextureLength = 0
+            beam.TextureSpeed = 0
+            beam.Width0 = w0 * 2.0
+            beam.Width1 = w0 * 0.45
+        else
+            -- 3D 光束：流动光带
+            beam.Texture = 'rbxassetid://446111271'
+            beam.TextureMode = Enum.TextureMode.Wrap
+            beam.TextureLength = 10
+            beam.TextureSpeed = 1.5
+            beam.Width0 = w0
+            beam.Width1 = w0
+        end
+        beam.ZOffset = -1
+        beam.Parent = beamFolder
+        local life = math.max(FX.TracerLife or 0.18, 0.05)
+        task.delay(life, function()
+            if not beam.Parent then return end
+            local t0 = tick()
+            local conn
+            conn = RunSvc.Heartbeat:Connect(function()
+                local alpha = math.clamp((tick() - t0) / 0.2, 0, 1)
+                beam.Transparency = NumberSequence.new(alpha)
+                if style == "3D 脉冲" then
+                    -- 边淡边收：像一道快速收束的光
+                    beam.Width0 = w0 * (2.0 - 1.5 * alpha)
+                    beam.Width1 = w0 * (0.45 + 0.25 * alpha)
+                end
+                if alpha >= 1 then
+                    conn:Disconnect()
+                    pcall(function() beam:Destroy(); a0:Destroy(); a1:Destroy() end)
+                end
+            end)
+        end)
+    end
+
+    -- 起点万一落在相机背后（第三人称贴墙等），沿弹道方向推到相机前方再投影，
+    -- 否则 WorldToViewportPoint 会镜像，整条线会画反/消失
+    local function clampFront(cam, a, b)
+        local ok1, ca = pcall(function() return cam.CFrame:PointToObjectSpace(a) end)
+        if not ok1 or not ca then return a end
+        if ca.Z <= -1 then return a end
+        local ok2, cb = pcall(function() return cam.CFrame:PointToObjectSpace(b) end)
+        if not ok2 or not cb or cb.Z >= -1 then return nil end
+        local lo, hi = 0, 1
+        for _ = 1, 12 do
+            local mid = (lo + hi) * 0.5
+            if ca:Lerp(cb, mid).Z <= -1 then hi = mid else lo = mid end
+        end
+        return cam.CFrame:PointToWorldSpace(ca:Lerp(cb, hi))
+    end
+
+    local drawLine2D
+    if hasDrawing then
+        for i = 1, TRACER_POOL do
+            local line = Drawing.new("Line")
+            line.Visible = false
+            line.Thickness = 1
+            line.ZIndex = 2
+            local outline = Drawing.new("Line")
+            outline.Visible = false
+            outline.Thickness = 3
+            outline.ZIndex = 1
+            tracers[i] = { line = line, outline = outline, from = nil, to = nil,
+                           born = 0, life = 0 }
+        end
+        local idx = 0
+        RunSvc.RenderStepped:Connect(function()
+            local cam = workspace.CurrentCamera
+            if not cam then return end
+            local now = tick()
+            for _, t in ipairs(tracers) do
+                if t.born > 0 then
+                    local age = now - t.born
+                    if age > t.life + 0.2 then
+                        t.line.Visible = false
+                        t.outline.Visible = false
+                        t.born = 0
+                    else
+                        local src = clampFront(cam, t.from, t.to)
+                        local p2, on2 = cam:WorldToViewportPoint(t.to)
+                        local p1 = src and cam:WorldToViewportPoint(src)
+                        if p1 and p2 and on2 and p1.Z > 0 and p2.Z > 0 then
+                            local fade = age > t.life
+                                and (1 - math.clamp((age - t.life) / 0.2, 0, 1)) or 1
+                            local av = Vector2.new(p1.X, p1.Y)
+                            local bv = Vector2.new(p2.X, p2.Y)
+                            t.line.From, t.line.To = av, bv
+                            t.outline.From, t.outline.To = av, bv
+                            local st  = FX.TracerStyle or "经典"
+                            local col = FX.TracerColor
+                            local w   = FX.TracerWidth or 1.5
+                            local showOut = true
+                            if st == "粗光晕" then
+                                w = w * 2.8
+                            elseif st == "细针" then
+                                w = 1
+                                showOut = false
+                            elseif st == "霓虹" then
+                                w = w * 1.9
+                                col = Color3.new(
+                                    math.min(col.R * 1.2 + 0.12, 1),
+                                    math.min(col.G * 1.2 + 0.12, 1),
+                                    math.min(col.B * 1.2 + 0.12, 1))
+                            end
+                            t.line.Color = col
+                            t.outline.Color = Color3.new(0, 0, 0)
+                            t.line.Thickness = w
+                            t.outline.Thickness = w + 2.5
+                            t.line.Transparency = fade
+                            t.outline.Transparency = showOut and (fade * 0.65) or 1
+                            t.line.Visible = true
+                            t.outline.Visible = showOut
+                        else
+                            t.line.Visible = false
+                            t.outline.Visible = false
+                        end
+                    end
+                end
+            end
+        end)
+        drawLine2D = function(a, b)
+            idx = idx % TRACER_POOL + 1
+            local t = tracers[idx]
+            t.from, t.to = a, b
+            t.born = tick()
+            t.life = math.max(FX.TracerLife or 0.18, 0.03)
+        end
+    end
+
+    -- ---------- 对外入口 ----------
+    function FX.play(fromPos, toPos, model)
+        if not FX.Enabled then return end
+        if FX.Hitmarker then
+            pcall(hitmarker)
+            if FX.Effect then pcall(flash); pcall(fovPunch) end
+            pcall(playSound)
+            if model then pcall(hitChams, model) end
+        end
+        if FX.Tracer and fromPos and toPos then
+            local st = FX.TracerStyle or "经典"
+            local force3D = (st == "3D 光束" or st == "3D 脉冲")
+            pcall(function()
+                if force3D or not hasDrawing then
+                    drawBeam3D(fromPos, toPos)
+                else
+                    drawLine2D(fromPos, toPos)
+                end
+            end)
+        end
+    end
+    FX.SetHit    = function(v) FX.Hitmarker = v and true or false; return FX.Hitmarker end
+    FX.SetTracer = function(v) FX.Tracer    = v and true or false; return FX.Tracer end
+    FX.SetTracerStyle = function(s)
+        local t = tostring(s or "")
+        if t == "" then return FX.TracerStyle end
+        for _, k in ipairs({ "经典", "粗光晕", "细针", "霓虹", "3D 光束", "3D 脉冲" }) do
+            if t == k then FX.TracerStyle = k; return FX.TracerStyle end
+        end
+        return FX.TracerStyle
+    end
+    FX.SetEnabled = function(v)
+        FX.Enabled = v and true or false
+        return FX.Enabled
+    end
+    FX.Dump = function()
+        return string.format("RageFX Enabled=%s Hit=%s Tracer=%s Style=%s Drawing=%s Gui=%s",
+            tostring(FX.Enabled), tostring(FX.Hitmarker), tostring(FX.Tracer),
+            tostring(FX.TracerStyle), tostring(hasDrawing), tostring(fxGui.Parent ~= nil))
+    end
+
+    print("[RAGEFX] 命中反馈/弹道已就绪 · 诊断 G.RAGE_FX.Dump()")
+end
+
+-- ============================================================
 -- GunAction 自动射击 v15（第三栏「攻击」）· 内嵌版
 -- 复用主脚本的 G(getgenv)；BODY 与独立模块 gunbot.lua 完全一致。
 -- 目标：玩家 / SCP / 全部 + 锁定具体玩家名或 SCP 编号；默认关闭零发包。
@@ -3072,7 +3616,8 @@ do
     -- --------------------------------------------------------
     local B = {
         Enabled      = false,      -- 总开关，默认关
-        Mode         = "玩家",     -- "玩家" | "SCP" | "全部"
+        Mode         = "SCP",      -- "玩家" | "SCP" | "全部"（rage 默认打 SCP）
+        TeamMode     = "both",     -- both=同队+旁观者都不打 | team=仅同队 | spec=仅旁观者 | off=全不检测
         LockTarget   = "",         -- 锁定具体目标（玩家名 / SCP 编号 / 标签）；空 = 自动选最近
         PlayerFilter = "",         -- 只打名字含此串的玩家；空 = 全部玩家
         SCPFilter    = "",         -- 只打编号含此串的 SCP；空 = 全部 SCP
@@ -3081,7 +3626,10 @@ do
         FireDelay    = 0.08,
         CheckWall    = true,
         RespectTeam  = true,
-        FromCamera   = true,
+        FromCamera   = true,       -- 已废弃：弹道与墙检固定从人物发出，仅无角色时兜底用相机
+        CheckAmmo    = true,       -- 弹匣为空时不开枪（服务端同样不结算，发包只会被丢弃）
+        Ammo         = nil,        -- 当前读到的弹匣数（nil = 读不到，不拦截）
+        NoAmmo       = false,      -- 上帧是否因空仓被拦
         DeepScan     = false,      -- 额外全扫 workspace（默认关，省性能）
         ShowFloat    = true,       -- 手机浮动大按钮
         -- 统计 / 诊断
@@ -3319,9 +3867,13 @@ do
     -- --------------------------------------------------------
     -- 过滤：类别 / 锁定 / 筛选 / 同队
     -- --------------------------------------------------------
+    -- 队伍检测档位（rage 页下拉）：both 同队+旁观者都不打 / team 仅同队 / spec 仅旁观者 / off 全不检测
+    local function skipGhost() return B.TeamMode == "both" or B.TeamMode == "spec" end
+    local function skipTeam()  return B.TeamMode == "both" or B.TeamMode == "team" end
+
     local function wanted(c)
-        -- 旁观者（Ghost 幽灵）永不攻击：_CLASS=nil，非有效目标
-        if c.player and isGhostSpec(c.player) then return false end
+        -- 旁观者（Ghost 幽灵）按档位过滤；默认档位不打
+        if c.player and skipGhost() and isGhostSpec(c.player) then return false end
         if B.Mode == "玩家" and c.kind ~= "Player" then return false end
         if B.Mode == "SCP"  and c.kind ~= "SCP"  then return false end
 
@@ -3345,7 +3897,7 @@ do
             end
         end
 
-        if B.RespectTeam and c.player then
+        if skipTeam() and c.player then
             -- 暴乱模式：按职业队伍（Guard系 vs ClassD），只打对面，不打同队
             if isRiotMode() then
                 local myT = teamOfPlayer(LP)
@@ -3364,15 +3916,18 @@ do
     -- 射线墙检（原脚本逻辑，全部 pcall 保护）
     -- --------------------------------------------------------
     local function clearShot(part, localChar)
+        -- 与弹道同源：统一从人物（Head → HumanoidRootPart → 相机兜底）出发做遮挡判定，
+        -- 避免「相机能打到、人物其实在墙后」这种视觉与判定不一致
         local origin
-        if B.FromCamera then
+        local mh = localChar and localChar:FindFirstChild("Head")
+        if mh then pcall(function() origin = mh.Position end) end
+        if not origin then
+            local mh2 = localChar and localChar:FindFirstChild("HumanoidRootPart")
+            if mh2 then pcall(function() origin = mh2.Position end) end
+        end
+        if not origin then
             local ok, cam = pcall(function() return WS.CurrentCamera end)
-            if ok and cam then
-                pcall(function() origin = cam.CFrame.Position end)
-            end
-        else
-            local mh = localChar and localChar:FindFirstChild("Head")
-            if mh then pcall(function() origin = mh.Position end) end
+            if ok and cam then pcall(function() origin = cam.CFrame.Position end) end
         end
         local okPos, to = pcall(function() return part.Position end)
         if not okPos or not to then return true end
@@ -3418,18 +3973,142 @@ do
         return remote
     end
 
+    -- 弹道起点 = 人物自身：Head → HumanoidRootPart → 相机（仅角色不存在时兜底）
+    -- --------------------------------------------------------
+    -- 弹匣（空仓不开枪）
+    -- --------------------------------------------------------
+    local lastTouch = nil
+    pcall(function()
+        UIS.InputBegan:Connect(function(i)
+            if i and i.UserInputType == Enum.UserInputType.Touch then lastTouch = i end
+        end)
+    end)
+
+    local function heldTool()
+        local ch = LP and LP.Character
+        if not ch then return nil end
+        local ok, t = pcall(function() return ch:FindFirstChildOfClass("Tool") end)
+        return (ok and t) or nil
+    end
+
+    -- 依次尝试：Mag（枪械框架通用）/ 属性 Ammo·Clip·CurrentAmmo / 同名数值对象
+    local function readAmmo(tool)
+        if not tool then return nil end
+        local o
+        pcall(function() o = tool:FindFirstChild("Mag", true) end)
+        if o then
+            local v
+            pcall(function() v = tonumber(o.Value) end)
+            if v then return v, o end
+        end
+        for _, k in ipairs({ "Ammo", "Clip", "CurrentAmmo", "Bullets", "AmmoCount" }) do
+            local a
+            pcall(function() a = tonumber(tool:GetAttribute(k)) end)
+            if a then return a, nil end
+            local c
+            pcall(function() c = tool:FindFirstChild(k, true) end)
+            if c then
+                local v
+                pcall(function() v = tonumber(c.Value) end)
+                if v then return v, c end
+            end
+        end
+        return nil, nil
+    end
+
+    local reloadAt = 0
+    -- 走游戏自带换弹按钮的 GUI 回调（不产生系统鼠标事件，手机端不会退化成电脑端）
+    local function tryReload()
+        local now = os.clock()
+        if now - reloadAt < 1.0 then return false end
+        reloadAt = now
+        local done = false
+        pcall(function()
+            if not getconnections then return end
+            local pg = LP and LP:FindFirstChild("PlayerGui")
+            local sc = pg and pg:FindFirstChild("FEGKSessionControls")
+            local mb = sc and sc:FindFirstChild("MobileButtons")
+            local btn = mb and mb:FindFirstChild("ReloadButton")
+            if not btn then
+                -- 兜底：整个 PlayerGui 里找名字带 Reload 的按钮
+                local found
+                pcall(function() found = pg and pg:FindFirstChild("ReloadButton", true) end)
+                btn = found
+            end
+            if not (btn and btn.InputBegan) then return end
+            local touch = lastTouch or (getgenv and getgenv()._TOUCH)
+            local conns = getconnections(btn.InputBegan)
+            for _, c in ipairs(conns or {}) do
+                pcall(function() c.Function(touch) end)
+                done = true
+            end
+        end)
+        return done
+    end
+
+    local function fireOrigin()
+        local lc = LP and LP.Character
+        local hd = lc and lc:FindFirstChild("Head")
+        if hd then
+            local okP, p = pcall(function() return hd.Position end)
+            if okP and p then return p end
+        end
+        local hrp = lc and lc:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            local okP, p = pcall(function() return hrp.Position end)
+            if okP and p then return p end
+        end
+        local ok, cam = pcall(function() return WS.CurrentCamera end)
+        if ok and cam then
+            local okP, p = pcall(function() return cam.CFrame.Position end)
+            if okP and p then return p end
+        end
+        return nil
+    end
+
+    local ammoCacheAt, ammoCacheVal = 0, nil
     local function fire(c)
         local r = getRemote()
         if not r then
             B.Status = "未找到 Remotes.GunAction"
             return false
         end
+        -- 空仓不开枪：手上没枪 / 读不到弹匣时不拦截，避免误判导致整体失效
+        if B.CheckAmmo then
+            local tool = heldTool()
+            local n
+            if tool then
+                local now2 = os.clock()
+                if now2 - ammoCacheAt > 0.15 then
+                    local v = readAmmo(tool)
+                    ammoCacheAt, ammoCacheVal = now2, v
+                    n = v
+                else
+                    n = ammoCacheVal
+                end
+            end
+            B.Ammo = n
+            if tool and n and n <= 0 then
+                B.NoAmmo = true
+                B.Status = "弹匣空 · 不开枪（已尝试换弹）"
+                tryReload()
+                return false
+            end
+            B.NoAmmo = false
+        end
+        local origin = fireOrigin()
+        local pos
         local ok, err = pcall(function()
-            local pos = c.part.Position
+            pos = c.part.Position
             r:FireServer("Shoot", pos, c.part)
         end)
         if ok then
             B.Shots = B.Shots + 1
+            -- rage：命中反馈 / 弹道显示（纯视觉，失败不影响发包）
+            local fx = G.RAGE_FX
+            if fx and fx.play and pos then
+                pcall(fx.play, origin, pos, c.model)
+            end
             return true
         else
             B.Errors = B.Errors + 1
@@ -3465,8 +4144,11 @@ do
             end)
         end
         local localChar = LP and LP.Character
+        local tried = 0
         for _, c in ipairs(list) do
             if clearShot(c.part, localChar) then return c end
+            tried = tried + 1
+            if tried >= 12 then break end   -- 每轮最多 12 次射线，避免视野差时疯狂 Raycast
         end
         return nil
     end
@@ -3508,7 +4190,7 @@ do
     local function refreshFloat()
         if not btn then return end
         pcall(function()
-            btn.Text = string.format("自动射击:%s  模式:%s\n目标:%s  发%d 错%d",
+            btn.Text = string.format("rage:%s  攻击:%s\n目标:%s  发%d 错%d",
                 B.Enabled and "开" or "关", B.Mode, B.CurTarget, B.Shots, B.Errors)
             btn.BackgroundColor3 = B.Enabled
                 and Color3.fromRGB(30, 90, 40) or Color3.fromRGB(30, 30, 30)
@@ -3582,9 +4264,12 @@ do
     end
     B.SetMode = function(s)
         local t = lo(s)
-        if t == "player" or t == "p" or t == "玩家" then B.Mode = "玩家"
-        elseif t == "scp" or t == "s" then B.Mode = "SCP"
-        elseif t == "all" or t == "both" or t == "全部" or t == "全" then B.Mode = "全部"
+        if string.find(t, "全部", 1, true) or t == "all" or t == "both" then
+            B.Mode = "全部"
+        elseif string.find(t, "scp", 1, true) or t == "s" then
+            B.Mode = "SCP"
+        elseif string.find(t, "玩家", 1, true) or t == "player" or t == "p" then
+            B.Mode = "玩家"
         end
         return B.Mode
     end
@@ -3619,7 +4304,27 @@ do
     B.SetDelay        = function(n) B.FireDelay    = math.max(0.01, tonumber(n) or 0.08); return B.FireDelay end
     B.SetRange        = function(n) B.MaxDistance  = tonumber(n) or 800; return B.MaxDistance end
     B.SetWall         = function(v) B.CheckWall    = v and true or false; return B.CheckWall end
-    B.SetTeam         = function(v) B.RespectTeam  = v and true or false; return B.RespectTeam end
+    B.SetTeam         = function(v)
+        B.RespectTeam = v and true or false
+        B.TeamMode = B.RespectTeam and "both" or "off"
+        return B.RespectTeam
+    end
+    B.SetTeamMode     = function(s)
+        local t = lo(s)
+        if t == "both" then B.TeamMode = "both"
+        elseif t == "team" then B.TeamMode = "team"
+        elseif t == "spec" then B.TeamMode = "spec"
+        elseif t == "off" or t == "all" then B.TeamMode = "off"
+        elseif string.find(t, "全部", 1, true) or string.find(t, "全不", 1, true) then B.TeamMode = "off"
+        elseif string.find(t, "仅旁观", 1, true) then B.TeamMode = "spec"
+        elseif string.find(t, "仅同队", 1, true) then B.TeamMode = "team"
+        elseif string.find(t, "同队", 1, true) and string.find(t, "旁观", 1, true) then B.TeamMode = "both"
+        elseif string.find(t, "旁观", 1, true) then B.TeamMode = "spec"
+        elseif string.find(t, "同队", 1, true) then B.TeamMode = "team"
+        end
+        B.RespectTeam = (B.TeamMode == "both" or B.TeamMode == "team")
+        return B.TeamMode
+    end
     B.SetFromCamera   = function(v) B.FromCamera   = v and true or false; return B.FromCamera end
     B.SetDeepScan     = function(v) B.DeepScan     = v and true or false; return B.DeepScan end
     B.SetFloat        = function(v) B.ShowFloat    = v and true or false; applyFloat(); return B.ShowFloat end
@@ -3635,8 +4340,8 @@ do
 
     B.Dump = function()
         local o = {}
-        o[#o + 1] = string.format("Enabled=%s Mode=%s Lock=%s PFilter=%s SFilter=%s",
-            tostring(B.Enabled), B.Mode, tostring(B.LockTarget),
+        o[#o + 1] = string.format("Enabled=%s Mode=%s Team=%s Lock=%s PFilter=%s SFilter=%s",
+            tostring(B.Enabled), B.Mode, tostring(B.TeamMode), tostring(B.LockTarget),
             tostring(B.PlayerFilter), tostring(B.SCPFilter))
         o[#o + 1] = string.format("Remote=%s Aim=%s Dist=%s Delay=%.3f Wall=%s Team=%s Cam=%s Deep=%s Float=%s",
             tostring(B.RemoteOK), B.AimPart, tostring(B.MaxDistance), B.FireDelay,
@@ -3644,6 +4349,9 @@ do
             tostring(B.DeepScan), tostring(B.ShowFloat))
         o[#o + 1] = string.format("Shots=%d Errors=%d CurTarget=%s Status=%s",
             B.Shots, B.Errors, tostring(B.CurTarget), tostring(B.Status))
+        o[#o + 1] = string.format("Ammo=%s NoAmmo=%s CheckAmmo=%s Tool=%s",
+            B.Ammo == nil and "读不到" or tostring(B.Ammo), tostring(B.NoAmmo),
+            tostring(B.CheckAmmo), tostring(heldTool() and "手持" or "无"))
         rebuild()
         o[#o + 1] = "候选 " .. tostring(#cache) .. " 个："
         local n = 0
@@ -4295,6 +5003,40 @@ do
         return anc == WS
     end
 
+    -- SCP 本体判定：自己变成 SCP 时绝不写 WalkSpeed
+    -- （173/106/682/049 等移速由各自 SCP 控制器驱动，被我们覆盖就会「失去原本速度」）
+    local SCP_NUM_SET = {
+        ["049"] = true, ["035"] = true, ["079"] = true, ["096"] = true, ["106"] = true,
+        ["173"] = true, ["682"] = true, ["777"] = true, ["939"] = true, ["966"] = true,
+        ["999"] = true, ["457"] = true, ["066"] = true, ["076"] = true, ["008"] = true,
+        ["610"] = true, ["131"] = true,
+    }
+    local scpFlag, scpAt = false, 0
+    local function isScpNow()
+        local now = tick()
+        if now - scpAt < 0.4 then return scpFlag end
+        scpAt = now
+        scpFlag = false
+        local ch = P and P.Character
+        if not ch then return false end
+        -- ① 主脚本权威判定（Class/Controller/Role/SCP/Team/标签，已排除人类阵营词）
+        local okC, lbl = pcall(function() return G.classifySCP and G.classifySCP(ch) end)
+        if okC and lbl then scpFlag = true; return true end
+        -- ② 兜底：直接读 Class / Role / SCP / CurrentSCP 属性
+        for _, k in ipairs({ "Class", "Controller", "Role", "SCP", "CurrentSCP", "PlayingAs" }) do
+            local okA, v = pcall(function() return ch:GetAttribute(k) end)
+            if okA and v ~= nil then
+                local s = string.lower(tostring(v))
+                s = string.gsub(s, "[-_%s]", "")
+                if SCP_NUM_SET[s] or s == "scp" or string.find(s, "scpcharacter", 1, true) then
+                    scpFlag = true
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
     local function isRunning()
         if not RC then
             pcall(function() RC = require(RS.RunSystem.Controllers.RunController) end)
@@ -4317,6 +5059,12 @@ do
         if not SC.Enabled or SC.Paused then return end
         local h = getHum()
         if not h or not playable() then return end
+        -- SCP 本体：只跳过、不写速度（否则 173/106 等会失去原生移速）
+        if isScpNow() then
+            SC.ScpSkip = true
+            return
+        end
+        SC.ScpSkip = false
         local target = isRunning() and SC.RunTarget or SC.WalkTarget
         if math.abs((tonumber(h.WalkSpeed) or 0) - target) > 0.05 then
             pcall(function() h.WalkSpeed = target end)
@@ -4358,9 +5106,9 @@ do
             warn("[SPEED] 已开启：走路下限=" .. SC.WalkMin .. " 跑步下限=" .. SC.RunMin
                  .. " 目标=" .. SC.WalkTarget .. "/" .. SC.RunTarget)
         else
-            -- 关闭：还原到检测到的原始速度
+            -- 关闭：还原到检测到的原始速度（自己当前是 SCP 时不还原，交给 SCP 控制器）
             local h = getHum()
-            if h then pcall(function() h.WalkSpeed = SC.WalkMin end) end
+            if h and not isScpNow() then pcall(function() h.WalkSpeed = SC.WalkMin end) end
             warn("[SPEED] 已关闭：WalkSpeed 还原为 " .. SC.WalkMin)
         end
     end
@@ -4373,6 +5121,7 @@ do
             "检测原速(下限): Walk=" .. SC.WalkMin .. " Run=" .. SC.RunMin .. " Detected=" .. tostring(SC.Detected),
             "目标速度: Walk=" .. SC.WalkTarget .. " Run=" .. SC.RunTarget,
             "当前 WalkSpeed=" .. tostring(h and h.WalkSpeed or "-") .. " IsRunning=" .. tostring(isRunning()),
+            "我是SCP=" .. tostring(isScpNow()) .. " 跳过写入=" .. tostring(SC.ScpSkip == true),
             "Applied=" .. SC.Applied,
         }, "\n")
     end
@@ -4381,7 +5130,7 @@ do
         if SC.Conn then pcall(function() SC.Conn:Disconnect() end) end
         if SC.CharConn then pcall(function() SC.CharConn:Disconnect() end) end
         local h = getHum()
-        if h then pcall(function() h.WalkSpeed = SC.WalkMin end) end
+        if h and not isScpNow() then pcall(function() h.WalkSpeed = SC.WalkMin end) end
         G.SPEED = nil
     end
 
@@ -4504,7 +5253,7 @@ do
         local ok = false
         pcall(function()
             if FPP then
-                FPP(pp, 1, true)
+                FPP(pp, 0.01, true)
             else
                 pp:InputHoldBegin()
                 task.delay(0.05, function() pcall(function() pp:InputHoldEnd() end) end)
@@ -4562,14 +5311,21 @@ do
     local function startScan()
         if D.ScanConn then return end
         pcall(refreshCache)
-        D._acc, D._cacheT = 0, os.clock()
+        D._acc, D._cacheT, D._dirty = 0, os.clock(), false
+        -- 新出现互动按钮 → 立即标脏，下一帧就重建缓存（比原来 2s 轮询更快，稳态开销只剩 6s 一次）
+        if not D.AddedConn then
+            D.AddedConn = WS.DescendantAdded:Connect(function(x)
+                pcall(function() if x:IsA("ProximityPrompt") then D._dirty = true end end)
+            end)
+        end
         D.ScanConn = RUS.Heartbeat:Connect(function()
             D._acc = (D._acc or 0) + 1
-            if D._acc < 2 then return end   -- 每2帧测距（原4帧，响应更快）
+            if D._acc < 2 then return end   -- 每2帧测距
             D._acc = 0
             local t = os.clock()
-            if t - (D._cacheT or 0) >= 2 then  -- 缓存刷新 6秒→2秒：新门/新互动更快被发现
+            if D._dirty or t - (D._cacheT or 0) >= 6 then
                 D._cacheT = t
+                D._dirty = false
                 pcall(refreshCache)
             end
             pcall(scan)
@@ -4869,7 +5625,7 @@ do
     local function trigger(pp)
         local ok = false
         pcall(function()
-            if FPP then FPP(pp, 1, true)
+            if FPP then FPP(pp, 0.01, true)
             else
                 pp:InputHoldBegin()
                 task.delay(0.05, function() pcall(function() pp:InputHoldEnd() end) end)
@@ -4924,14 +5680,20 @@ do
     local function startScan()
         if C.ScanConn then return end
         pcall(refreshCache)
-        C._acc, C._cacheT = 0, os.clock()
+        C._acc, C._cacheT, C._dirty = 0, os.clock(), false
+        if not C.AddedConn then
+            C.AddedConn = WS.DescendantAdded:Connect(function(x)
+                pcall(function() if x:IsA("ProximityPrompt") then C._dirty = true end end)
+            end)
+        end
         C.ScanConn = RUS.Heartbeat:Connect(function()
             C._acc = (C._acc or 0) + 1
-            if C._acc < 2 then return end   -- 每2帧测距（原4帧，响应更快）
+            if C._acc < 2 then return end   -- 每2帧测距
             C._acc = 0
             local t = os.clock()
-            if t - (C._cacheT or 0) >= 2 then  -- 缓存刷新 7秒→2秒：新箱/新互动更快被发现
+            if C._dirty or t - (C._cacheT or 0) >= 6 then
                 C._cacheT = t
+                C._dirty = false
                 pcall(refreshCache)
             end
             pcall(scan)
@@ -5148,6 +5910,18 @@ do
     local HS = game:GetService("HttpService")
     local FPP = (getgenv and getgenv().fireproximityprompt) or _G.fireproximityprompt
 
+    -- 【瞬间互动】fireproximityprompt 的第二个参数是"按住时长"，传 0.01 即
+    -- 立刻触发、完全跳过长按动画（旧版传 pp.hold，断路器/门/电脑要按住 1~3s）
+    local FIRE_HOLD = 0.01
+    local function fireNow(prompt, hold)
+        if not prompt or not FPP then return false end
+        local ok, res = pcall(function() return FPP(prompt, hold or FIRE_HOLD, true) end)
+        if ok and (res == true or res == nil) then return true end
+        -- 少数执行器不吃第三参/不吃 0：回退成不带 hold
+        local ok2 = pcall(function() return FPP(prompt) end)
+        return ok2
+    end
+
     -- 快速互动：任意 PP 的 hold 一开始立即 fire，跳过长按动画（用户提供脚本思路）
     local PPS = game:GetService("ProximityPromptService")
     local FastInteractConn = nil
@@ -5155,7 +5929,7 @@ do
         if FastInteractConn then return end
         FastInteractConn = PPS.PromptButtonHoldBegan:Connect(function(prompt)
             if prompt and prompt:IsA("ProximityPrompt") and FPP then
-                pcall(function() FPP(prompt) end)
+                fireNow(prompt)
             end
         end)
     end
@@ -5169,7 +5943,7 @@ do
     local F = {
         Enabled      = false,
         AutoVote     = false,    -- 内嵌版：投票统一由 AUTOFARM 负责，避免一局投两次
-        Tick         = 0.5,      -- 主循环间隔(秒)
+        Tick         = 0.2,      -- 主循环间隔(秒) · 瞬间互动：决策更快
         NodeHold     = 17,       -- 节点触发后地板下保持时长(秒)，>15s
         HideDepth    = 12,       -- 藏身距离节点(studs)，<NODE_RANGE=16；向上藏天花板上方，防地面SCP(049/173)
         StallSec     = 6,        -- 上传停滞多少秒判定可能超范围→逐档下调藏身高度重定位
@@ -5186,9 +5960,13 @@ do
         LastExit     = nil,      -- v16.13：最近一次有效逃离坐标（诊断用）
         ExitSrc      = "无",     -- v16.13：逃离坐标来源（属性 / targets / 场景）
         _exitScanPos = nil,      -- v16.13：场景出口扫描缓存
+        BadExitPos   = nil,      -- v16.21：站不住(被服务器拉回)的逃离坐标黑名单
+        _badExitAt   = 0,
+        LastDoorPos  = nil,      -- v16.21：最近一次金库门坐标（scene 兜底的高度基准）
         _exitScanAt  = -10,   -- 负数：保证首次立即扫描
         _ppCache     = nil,
         _ppCacheTime = 0,
+        BreakerDone  = {},       -- v16.20：新版任务「3 个断路器」，记录已触发坐标，防同一面板反复拉
     }
     G.AUTOESCAPE = F
 
@@ -5310,28 +6088,47 @@ do
             end
         end
         -- 最后兜底：场景里名字明确是出口区域的 Part（5 秒最多扫一次，避免每 tick 遍历）
+        -- 【v16.21 关键修复 · 「005 拿了钥匙却不开门」/「门后站死」的真凶】
+        -- 旧版只要名字里有 exitzone 就直接拿来当逃离坐标，本局实际命中：
+        --   Workspace.Map.Generated.Border.Vault_Exit.Markers.ExitZone @(-377,135,-72)
+        -- 那是金库出口竖井【顶部】的判定标记（周围全是 ShaftWall / GatePost / Hazard，
+        -- 是一段封死竖井，根本站不住），而真正的电梯在门后 y≈105。
+        -- 于是 doVaultDoor 一触发钥匙就「读到出口」→ 立刻 doExit → 把人钉进竖井 12 秒，
+        -- 门其实没开、清单不推进 → 现场就是「拿钥匙不开门 / 站着不动」。
+        -- 现在必须同时满足：① 与门(或 targets 目标)同高 |Δy| ≤ 15
+        --                   ② 水平距离门 ≤ 120 studs
+        -- 不满足就返回 nil，宁可等服务器下发 EscapeExitPosition，绝不乱传。
         local now = os.clock()
         if F._exitScanPos and (now - F._exitScanAt) < 5 then
             return F._exitScanPos, "scene(缓存)"
         end
         if (now - (F._exitScanAt or 0)) >= 5 then
             F._exitScanAt = now
+            local anchor = F.LastDoorPos
+            if not anchor then
+                for _, t in ipairs(readTargets()) do anchor = t.pos; break end
+            end
             local hit = nil
-            pcall(function()
-                for _, d in ipairs(WS:GetDescendants()) do
-                    local nm = lo(d.Name)
-                    if d:IsA("BasePart")
-                        and (nm:find("exitzone", 1, true) or nm:find("exittrigger", 1, true)
-                            or nm:find("escapezone", 1, true) or nm:find("escaperegion", 1, true)) then
-                        local pp = d.Position
-                        if math.abs(pp.X) < 5000 and math.abs(pp.Z) < 5000
-                            and pp.Y > -100 and pp.Y < 2000 then
-                            hit = pp
-                            break
+            if anchor then
+                pcall(function()
+                    for _, d in ipairs(WS:GetDescendants()) do
+                        local nm = lo(d.Name)
+                        if d:IsA("BasePart")
+                            and (nm:find("exitzone", 1, true) or nm:find("exittrigger", 1, true)
+                                or nm:find("escapezone", 1, true) or nm:find("escaperegion", 1, true)) then
+                            local pp = d.Position
+                            local dx, dz = pp.X - anchor.X, pp.Z - anchor.Z
+                            if math.abs(pp.X) < 5000 and math.abs(pp.Z) < 5000
+                                and pp.Y > -100 and pp.Y < 2000
+                                and math.abs(pp.Y - anchor.Y) <= 15
+                                and (dx * dx + dz * dz) <= 14400 then   -- 水平 ≤ 120 studs
+                                hit = pp
+                                break
+                            end
                         end
                     end
-                end
-            end)
+                end)
+            end
             F._exitScanPos = hit
         end
         if F._exitScanPos then return F._exitScanPos, "scene" end
@@ -5363,11 +6160,26 @@ do
             return F._ppCache
         end
         local list = {}
+        -- 【关键】PP 可能挂在 Attachment 下（如断路器 BreakerPrompt.ResetBreaker）：
+        -- 旧写法只找 parent 自己/直接子级 BasePart → 断路器 pos=nil，
+        -- findPP 无法按距离区分三个面板，永远拿到同一个 → 第三个闸门永远触发不到、
+        -- 人或钉在原地面板前不动。这里沿父级向上最多 4 层找最近的 BasePart。
+        local function hostPart(of)
+            local cur = of
+            for _ = 1, 4 do
+                if not cur or cur == WS then break end
+                if cur:IsA("BasePart") then return cur end
+                local bp = cur:FindFirstChildOfClass("BasePart")
+                if bp then return bp end
+                cur = cur.Parent
+            end
+            return nil
+        end
         pcall(function()
             for _, d in ipairs(WS:GetDescendants()) do
                 if d:IsA("ProximityPrompt") then
                     local parent = d.Parent
-                    local part = parent and (parent:IsA("BasePart") and parent or parent:FindFirstChildOfClass("BasePart"))
+                    local part = hostPart(parent)
                     list[#list + 1] = {
                         pp      = d,
                         action  = lo(d.ActionText),
@@ -5411,17 +6223,18 @@ do
     -- explicitPos: 当 PP 挂在 Attachment 上(无 part 坐标)时，用 targets 下发的坐标
     local function triggerPP(pp, explicitPos)
         if not pp or not FPP then return false end
+        -- 已经被别人触发/已禁用：直接算完成，不再空等
+        local okEn, en = pcall(function() return pp.pp and pp.pp.Enabled end)
+        if okEn and en == false then return true end
         local targetPos = pp.pos or explicitPos
         local ok = false
         pcall(function()
             if targetPos then
                 -- 站在 PP 前方（下降 0.9 ≈ 地板），保证进入 MaxActivationDistance
                 tpSoft(targetPos + Vector3.new(0, -0.9, 0))
-                task.wait(0.35)
+                task.wait(0.05)          -- 只等一帧位置同步（旧版 0.35s 白等）
             end
-            local hold = pp.hold > 0 and pp.hold or 0.2
-            local fired = FPP(pp.pp, hold, true)
-            ok = fired == true or fired == nil
+            ok = fireNow(pp.pp)
         end)
         return ok
     end
@@ -5441,10 +6254,9 @@ do
             pcall(function()
                 if targetPos then tpSoft(targetPos + Vector3.new(0, -0.9, 0)) end
             end)
-            task.wait(0.15)
-            local hold = p.hold > 0 and p.hold or 0.2
-            pcall(function() FPP(p.pp, hold, true) end)
-            task.wait(0.35)
+            task.wait(0.05)
+            fireNow(p.pp)
+            task.wait(0.12)                      -- 旧版 0.35s，瞬间互动后只需确认 disabled
             local ok2, en2 = pcall(function() return p.pp.Enabled end)
             if ok2 and en2 == false then return true end
         end
@@ -5476,11 +6288,10 @@ do
                 local targetPos = p.pos or nearPos
                 pcall(function()
                     if targetPos then tpSoft(targetPos + Vector3.new(0, -0.9, 0)) end
-                    task.wait(0.18)
-                    local hold = p.hold > 0 and p.hold or 0.2
-                    FPP(p.pp, hold, true)
+                    task.wait(0.05)
+                    fireNow(p.pp)
                 end)
-                task.wait(0.5)
+                task.wait(0.12)                 -- 旧版 0.5s；瞬间触发后 PP 立刻 disabled
                 local ok2, en2 = pcall(function() return p.pp.Enabled end)
                 if ok2 and en2 == false then return true end
             end
@@ -5528,7 +6339,12 @@ do
         local p = findPP(nil, "scp-079 console", nil, true)
         if not p then return false end
         triggerPP(p)
-        task.wait(1.5)
+        -- 瞬间互动：只等 PP 变 disabled / 清单推进（旧版死等 1.5s）
+        for _ = 1, 6 do
+            task.wait(0.08)
+            local ok, en = pcall(function() return p.pp.Enabled end)
+            if ok and en == false then break end
+        end
         return true
     end
 
@@ -5553,12 +6369,73 @@ do
     local function doDeliver(targetPos)
         F.Current = "交付记忆驱动器"
         tpSoft(targetPos + Vector3.new(0, -0.9, 2))
-        task.wait(0.5)
+        task.wait(0.06)
         -- 尝试触发控制台 Use（双保险，靠近本身也可能自动交付）
         local p = findPP(nil, "scp-079 console", targetPos, true)
         if p then triggerPP(p) end
-        task.wait(2)
+        -- 瞬间互动：等清单推进即可（旧版死等 2s）
+        for _ = 1, 10 do
+            task.wait(0.1)
+            if p then
+                local ok, en = pcall(function() return p.pp.Enabled end)
+                if ok and en == false then break end
+            end
+        end
         return true
+    end
+
+    -- 【v16.21】驱动器兜底：服务器只下发 NODE 时，checklist 仍停在「Bring SCP-079
+    -- its 2 memory drives」，targets 里既没有 MEMORY DRIVE 也没有 DELIVER，
+    -- 旧逻辑直接卡在「② 等待驱动器/交付目标」。这里改为直接扫场景 PP：
+    --   还有 Take drive / Memory drive 且 enabled → 捡它；没了 → 去 SCP-079 console 交付
+    local function doDriveFallback()
+        -- ① 还有没捡的驱动器
+        local p = findPP(nil, "memory drive", nil, true)
+        if not p then p = findPP("take drive", nil, nil, true) end
+        if not p then p = findPP(nil, "drive", nil, true) end
+        if p then
+            F.Current = "兜底拾取记忆驱动器"
+            F.Phase = "② 拾取驱动器(场景兜底)"
+            if p.pos then
+                tpSoft(p.pos + Vector3.new(0, -0.9, 0))
+                task.wait(0.05)
+            end
+            local okFire = fireNow(p.pp)
+            -- 验证：PP 变 disabled 或已被移除 = 捡到
+            for _ = 1, 10 do
+                task.wait(0.1)
+                local alive = false
+                pcall(function() alive = (p.pp.Parent ~= nil) and p.pp.Enabled end)
+                if not alive then
+                    F._ppCacheTime = 0
+                    return true
+                end
+            end
+            if okFire == false then F.Phase = "② 驱动器互动失败(重试)" end
+            return false
+        end
+        -- ② 没有驱动器了 → 去 079 控制台交付
+        local c = findPP(nil, "scp-079 console", nil, true)
+        if not c then c = findPP(nil, "console", nil, true) end
+        if not c then c = findPP("deliver", nil, nil, true) end
+        if c then
+            F.Current = "兜底交付(079 控制台)"
+            F.Phase = "② 交付驱动器(场景兜底)"
+            if c.pos then
+                tpSoft(c.pos + Vector3.new(0, -0.9, 2))
+                task.wait(0.06)
+            end
+            fireNow(c.pp)
+            for _ = 1, 8 do
+                task.wait(0.1)
+                local ok, en = pcall(function() return c.pp.Enabled end)
+                if ok and en == false then break end
+            end
+            F._ppCacheTime = 0
+            return true
+        end
+        F.Phase = "② 找不到驱动器/079 控制台"
+        return false
     end
 
     -- 节点通电：Start upload → 触发后藏地板下保持 15s+
@@ -5600,7 +6477,270 @@ do
         end
         if not p then return false end
         triggerPP(p)
-        task.wait(1.5)
+        for _ = 1, 6 do
+            task.wait(0.08)
+            local ok, en = pcall(function() return p.pp.Enabled end)
+            if ok and en == false then break end
+        end
+        return true
+    end
+
+    -- ============ 新版任务（2026.11）：Reset the 3 breakers / Throw the main switch ============
+    -- 现场实测清单：
+    --   {"text":"Reset the 3 breakers","done":false}
+    --   {"text":"Throw the main switch at the vault","done":false}
+    --   {"text":"Get into the elevator behind the door","done":false}
+    -- targets 只下发 BREAKER 三项：
+    --   [{"label":"BREAKER",x=-177.1,y=108,z=-30},{"label":"BREAKER",x=66,y=108,z=177.1},
+    --    {"label":"BREAKER",x=-151,y=108,z=158.9}]
+    -- 实例路径：Workspace.Map.Generated.Region_0_0.Hall_Straight.Fixtures.ElectricalPanel
+    --           .PanelGrey.BreakerPrompt.ResetBreaker（ProximityPrompt 挂在 Attachment 下，
+    --           取不到 part 坐标 → 必须用 targets 坐标作 explicitPos）
+    local function breakerKey(pos)
+        return string.format("%.0f_%.0f", pos.X, pos.Z)
+    end
+
+    -- 断路器：逐个传送并触发 Reset Breaker；成功后该项会从 targets 消失
+    local function doBreakers(breakers)
+        if #breakers == 0 then
+            -- 兜底：targets 完全没有闸门类 label 时，直接从场景里找可触发的
+            -- Reset breaker / Reboot（第三个闸门=服务器机柜就是这种情况）
+            local cand = nil
+            for _, q in ipairs(scanAllPPs()) do
+                local a = q.action or ""
+                if q.enabled and (a:find("reset", 1, true) or a:find("reboot", 1, true)) then
+                    cand = q
+                    break
+                end
+            end
+            if not cand then
+                F.Phase = "① 无断路器目标(可能已完成)"
+                return false
+            end
+            breakers = { {
+                label = (lo(cand.action):find("reboot", 1, true) and "SERVERS") or "BREAKER",
+                pos   = cand.pos or Vector3.new(0, 0, 0),
+            } }
+        end
+        -- 选一个「本地还没按过」的；全按过就取第一个等服务器判定
+        local t = nil
+        for _, b in ipairs(breakers) do
+            if not F.BreakerDone[breakerKey(b.pos)] then t = b; break end
+        end
+        local allDoneLocal = (t == nil)
+        if not t then t = breakers[1] end
+        local key = breakerKey(t.pos)
+        F.Current = string.format("闸门 @ %.0f,%.0f", t.pos.X, t.pos.Z)
+
+        -- 按坐标就近找这个闸门的 PP（pos 已在 scanAllPPs 中修好，能区分三个面板）
+        local isSrv = lo(t.label):find("server", 1, true) ~= nil
+            or lo(t.label):find("rack", 1, true) ~= nil
+        local function pickPP(onlyEnabled)
+            local q = findPP("reset", "breaker", t.pos, onlyEnabled)
+            if not q then q = findPP("reset", nil, t.pos, onlyEnabled) end
+            if not q then q = findPP("breaker", nil, t.pos, onlyEnabled) end
+            if not q then q = findPP("valve", nil, t.pos, onlyEnabled) end
+            if not q then q = findPP(nil, "breaker", t.pos, onlyEnabled) end
+            if not q then q = findPP(nil, "valve", t.pos, onlyEnabled) end
+            -- 第三个「闸门」是服务器机柜：Reboot | Server rack（label=SERVERS）
+            if isSrv then
+                if not q then q = findPP("reboot", nil, t.pos, onlyEnabled) end
+                if not q then q = findPP(nil, "server", t.pos, onlyEnabled) end
+                if not q then q = findPP(nil, "rack", t.pos, onlyEnabled) end
+            end
+            if not q then q = findPP("flip", nil, t.pos, onlyEnabled) end
+            if not q then q = findPP(nil, "panel", t.pos, onlyEnabled) end
+            return q
+        end
+
+        local p = pickPP(true)
+        if not p then
+            -- 贴近这个闸门再强制重扫一次（PP 可能在距离内才出现 / 缓存是旧的）
+            tpSoft(t.pos + Vector3.new(0, -0.9, 0))
+            task.wait(0.08)
+            local nowT = os.clock()
+            if (nowT - (F._breakerScanAt or 0)) > 0.6 then
+                F._breakerScanAt = nowT
+                scanAllPPs(true)
+            end
+            p = pickPP(true)
+        end
+
+        -- 【兜底】该坐标附近始终没有 PP：扫全场景所有 reset/valve/flip/open 类 PP，
+        -- 挑一个 enabled 且不在「已复位闸门」附近的去触发。
+        -- 现场情况：第三个阀门/面板的 PP 不一定挂在 targets 下发的那一点上，
+        -- 旧逻辑只看坐标附近 → 找不到就一直站在第二个闸门处不动。
+        if not p then
+            F.BreakerMiss = F.BreakerMiss or {}
+            local miss = (F.BreakerMiss[key] or 0) + 1
+            F.BreakerMiss[key] = miss
+            if miss >= 3 then
+                local cand = nil
+                for _, q in ipairs(scanAllPPs(true)) do
+                    local okUse = q.enabled
+                    if okUse and q.action then
+                        okUse = q.action:find("reset", 1, true) ~= nil
+                            or q.action:find("valve", 1, true) ~= nil
+                            or q.action:find("flip", 1, true) ~= nil
+                            or q.action:find("open", 1, true) ~= nil
+                            or q.action:find("breaker", 1, true) ~= nil
+                            or (q.obj and (q.obj:find("valve", 1, true) ~= nil
+                                or q.obj:find("breaker", 1, true) ~= nil))
+                    end
+                    if okUse and q.pos then
+                        -- 排除已经复位过的面板附近
+                        for _, b in ipairs(breakers) do
+                            if F.BreakerDone[breakerKey(b.pos)]
+                                and (q.pos - b.pos).Magnitude < 8 then
+                                okUse = false
+                                break
+                            end
+                        end
+                    end
+                    if okUse then cand = q; break end
+                end
+                if cand then
+                    p = cand
+                    F.Phase = string.format("① 闸门兜底：改触发 %s", tostring(cand.action))
+                end
+            end
+        end
+
+        -- 没有可触发的 PP：可能是这个面板已经复位（PP 变 disabled）
+        local already = false
+        if not p then
+            local q = pickPP(false)
+            if q then
+                local ok, en = pcall(function() return q.pp.Enabled end)
+                already = ok and (en == false)
+            end
+        end
+
+        local left = 0
+        for _, b in ipairs(breakers) do
+            if not F.BreakerDone[breakerKey(b.pos)] then left = left + 1 end
+        end
+        F.Phase = string.format("① 复位闸门(%d/%d)%s",
+            #breakers - left, #breakers,
+            (p and "") or (already and "（该闸门已复位）") or "（未找到互动点·贴近重试）")
+
+        -- 该面板已复位 → 记账后立刻处理下一个，绝不原地干等
+        if already then
+            F.BreakerDone[key] = true
+            F._ppCacheTime = 0
+            return true
+        end
+
+        if p then
+            -- 瞬间互动：立刻 fire，随后只验证 PP 是否变 disabled（0.08s × 6）
+            triggerPP(p, t.pos)
+            local got = false
+            for _ = 1, 6 do
+                task.wait(0.08)
+                local ok, en = pcall(function() return p.pp.Enabled end)
+                if ok and en == false then got = true break end
+            end
+            if not got then
+                -- 少数任务会校验"按住时长"：按其 HoldDuration 回退触发一次
+                fireNow(p.pp, math.max(1.0, p.hold or 0))
+                for _ = 1, 10 do
+                    task.wait(0.1)
+                    local ok, en = pcall(function() return p.pp.Enabled end)
+                    if ok and en == false then got = true break end
+                    local _, st2 = currentStep()
+                    if st2 and not st2:find("breaker", 1, true)
+                        and not st2:find("server", 1, true)
+                        and not st2:find("rack", 1, true) then got = true break end
+                end
+            end
+            if got then
+                F.BreakerDone[key] = true
+                F._ppCacheTime = 0
+                return true          -- 成功即走，不再等 3 秒服务器回执
+            end
+            -- 没生效：不记账，下一轮重新拿 PP 再触发（避免"误标完成→跳过第三个闸门"）
+            F.Phase = string.format("① 闸门触发未生效·重试 (%.0f,%.0f)", t.pos.X, t.pos.Z)
+            F._ppCacheTime = 0
+            return false
+        end
+
+        if allDoneLocal and left == 0 then
+            F.Phase = "① 闸门已全部复位(本地判定)"
+            F._ppCacheTime = 0
+            return true
+        end
+        F._ppCacheTime = 0
+        return false
+    end
+
+    -- 总闸：targets 可能给 MAIN SWITCH，也可能只有坐标没 label → 按关键词兜底
+    local function doMainSwitch(swPos, stepRaw)
+        F.Current = "拉金库总闸"
+        local function pick(onlyEnabled)
+            local q = nil
+            if swPos then
+                q = findPP("switch", nil, swPos, onlyEnabled)
+                if not q then q = findPP("throw", nil, swPos, onlyEnabled) end
+                if not q then q = findPP("main", nil, swPos, onlyEnabled) end
+                if not q then q = findPP("power", nil, swPos, onlyEnabled) end
+                if not q then q = findPP(nil, "switch", swPos, onlyEnabled) end
+                if not q then q = findPP(nil, "main", swPos, onlyEnabled) end
+            else
+                q = findPP("switch", nil, nil, onlyEnabled)
+                if not q then q = findPP("throw", nil, nil, onlyEnabled) end
+                if not q then q = findPP("main", nil, nil, onlyEnabled) end
+                if not q then q = findPP(nil, "switch", nil, onlyEnabled) end
+                if not q then q = findPP(nil, "main", nil, onlyEnabled) end
+            end
+            return q
+        end
+
+        local p = pick(true)
+        if not p and swPos then
+            -- 贴近总闸坐标再重扫（同断路器：PP 可能在距离内才出现）
+            tpSoft(swPos + Vector3.new(0, -0.9, 0))
+            task.wait(0.08)
+            scanAllPPs(true)
+            p = pick(true)
+        end
+        -- 兜底：全场景找 lever / switch / power / restore 类可触发 PP
+        if not p then
+            for _, q in ipairs(scanAllPPs()) do
+                local a = q.action or ""
+                if q.enabled and (a:find("switch", 1, true) or a:find("throw", 1, true)
+                    or a:find("pull", 1, true) or a:find("lever", 1, true)
+                    or a:find("power", 1, true) or a:find("restore", 1, true)) then
+                    p = q
+                    break
+                end
+            end
+        end
+
+        F.Phase = "② 拉总闸" .. (p and "" or "（未找到互动点·贴近重试）")
+        if p then
+            -- 瞬间互动 + 验证是否生效（清单推进或 PP disabled）
+            triggerPP(p, swPos)
+        elseif swPos then
+            tpSoft(swPos + Vector3.new(0, -0.9, 0))
+        end
+        -- 等清单推进（该步置 done 或直接变成电梯步）· 0.1s 一轮，最快交权
+        for _ = 1, 12 do
+            task.wait(0.1)
+            if not F.Enabled or not inEscapeRound() then return false end
+            local _, _, raw = currentStep()
+            if raw == nil or raw == "" or raw ~= stepRaw then
+                F._ppCacheTime = 0
+                return true
+            end
+            if p then
+                local ok, en = pcall(function() return p.pp.Enabled end)
+                if ok and en == false then
+                    F._ppCacheTime = 0
+                    return true
+                end
+            end
+        end
+        F._ppCacheTime = 0
         return true
     end
 
@@ -5612,39 +6752,89 @@ do
         F.Current = "金库门用钥匙(锚定)"
         if not targetPos then return false end
         local _, _, stepRaw = currentStep()   -- 记住当前步文本，门开后本地标记完成
-        -- 找钥匙开关 PP（turn / insert / use + key，兜底 switch）
-        local p = findPP("turn", "key", targetPos, true)
-        if not p then p = findPP("insert", nil, targetPos, true) end
-        if not p then p = findPP("use", "key", targetPos, true) end
-        if not p then p = findPP("key", nil, targetPos, true) end
-        if not p then p = findPP("switch", nil, targetPos, true) end
-        if p then
-            -- 锚定到 PP/开关位置（瞬间完成，无需长按停留）
-            local at = p.pos or (targetPos + Vector3.new(0, -4.5, 0))
-            tpAnchor(at + Vector3.new(0, -0.9, 0))
-            task.wait(0.2)
-            triggerPP(p, at)
-            -- 验证钥匙 PP 是否真的触发（成功后 disabled），失败当场重试
-            local ok, en = pcall(function() return p.pp and p.pp.Enabled end)
-            if ok and en ~= false then
-                tpSoft(at + Vector3.new(0, -0.9, 0)); task.wait(0.15)
-                pcall(function() FPP(p.pp, p.hold > 0 and p.hold or 0.2, true) end)
-                task.wait(0.3)
+        F.LastDoorPos = targetPos             -- 供 readLiftPos 的场景兜底做高度/距离基准
+        -- 【v16.21】钥匙是 Tool：多数实现要求"手持钥匙"才出现 Turn the key 提示。
+        -- 现场「Carried by xxx」= 钥匙在背包但没装备 → 门口什么都不显示、也开不了门。
+        pcall(function()
+            local hum, ch = getHum(), LP.Character
+            if not hum or not ch then return end
+            local holding = ch:FindFirstChildOfClass("Tool")
+            if holding and lo(holding.Name):find("key", 1, true) then return end
+            local bp = LP:FindFirstChildOfClass("Backpack")
+            if bp then
+                for _, t in ipairs(bp:GetChildren()) do
+                    if t:IsA("Tool") and lo(t.Name):find("key", 1, true) then
+                        hum:EquipTool(t)
+                        return
+                    end
+                end
             end
-        else
-            -- 无 PP 则锚定到钥匙插入点（接触式）
-            tpAnchor(targetPos + Vector3.new(0, -4.5, 0))
+            for _, t in ipairs(ch:GetChildren()) do
+                if t:IsA("Tool") and lo(t.Name):find("key", 1, true) then
+                    hum:EquipTool(t)
+                    return
+                end
+            end
+        end)
+        -- 【v16.21】钥匙 PP 现场实测：ActionText="Turn the key"，ObjectText="Vault door"
+        -- （不含 key！）。旧版第一个匹配 findPP("turn","key") 永远失败，靠兜底才命中；
+        -- 一旦缓存没刷新就直接放弃，人站在门口不动。现在改成"循环重试 + 每轮强制重扫"。
+        local fired, p = false, nil
+        for attempt = 1, 10 do
+            if not F.Enabled then break end
+            p = findPP("turn", "key", targetPos, true)
+                or findPP("insert", nil, targetPos, true)
+                or findPP("use", "key", targetPos, true)
+                or findPP("unlock", nil, targetPos, true)
+                or findPP("key", nil, targetPos, true)
+                or findPP("switch", nil, targetPos, true)
+            if not p and attempt > 1 then
+                scanAllPPs(true)                 -- PP 刚被服务器启用：强制重扫一次
+                p = findPP("key", nil, targetPos, true) or findPP("unlock", nil, targetPos, true)
+            end
+            if p then
+                local at = p.pos or (targetPos + Vector3.new(0, -4.5, 0))
+                -- 先不锚定贴近（锚定会被服务器位置校验/门板碰撞拒绝），触发再看结果
+                -- 站立时 HRP 比钥匙孔高约 2~3 studs，用 +2 落到地面而不是沉进门体
+                tpSoft(at + Vector3.new(0, 2, 0))
+                task.wait(0.05)
+                fireNow(p.pp)
+                task.wait(0.12)
+                local ok, en = pcall(function() return p.pp and p.pp.Enabled end)
+                if ok and en == false then fired = true; break end
+                -- 仍 enabled：再贴近一点 + 再 fire 一次
+                tpSoft(at + Vector3.new(0, 1.2, 0))
+                task.wait(0.05)
+                fireNow(p.pp)
+                task.wait(0.14)
+                local ok2, en2 = pcall(function() return p.pp and p.pp.Enabled end)
+                if ok2 and en2 == false then fired = true; break end
+                -- 清单已推进（"Unlocked by ..."）也算成功
+                local _, _, raw2 = currentStep()
+                if raw2 and stepRaw and raw2 ~= stepRaw then fired = true; break end
+            else
+                -- 还没找到可用的钥匙 PP：站到门坐标前方（不锚定），等它变 enabled
+                tpSoft(targetPos + Vector3.new(0, 2, 0))
+            end
+            task.wait(0.2)
+        end
+        if not fired then
+            F.Phase = "金库门：钥匙提示未触发(重试中)"
         end
         -- 【v16.13 修复 · 用户反馈的 bug】门板动画 + 服务器下发 EscapeExitPosition 有延迟，
         -- 旧版只轮询 6×0.4=2.4 秒，经常还没下发就 return，主循环又把同一步重做一遍
         -- → 表现就是「插钥匙把门打开了，但人站着不动、不去逃离」。
         -- 现在最多等 8 秒；期间清单若已推进到下一步（如金库电脑上传）立刻交回主循环。
+        -- 【v16.21】scene 兜底坐标（ExitZone 竖井标记）不再当作"门已开"的信号：
+        -- 只认服务器属性 / targets 下发，缓存坐标也不再盲目使用。
         local exit, esrc = readLiftPos()
+        if esrc and tostring(esrc):find("scene", 1, true) then exit, esrc = nil, nil end
         if not exit then
-            for _ = 1, 16 do
+            for _ = 1, 24 do
                 if not F.Enabled or not inEscapeRound() then break end
-                task.wait(0.5)
+                task.wait(0.15)
                 exit, esrc = readLiftPos()
+                if esrc and tostring(esrc):find("scene", 1, true) then exit = nil end
                 if exit then break end
                 local _, _, raw2 = currentStep()
                 if raw2 and raw2 ~= "" and raw2 ~= stepRaw then break end
@@ -5696,14 +6886,18 @@ do
             end
             uploaded = true
         end
-        -- 立即直奔电梯：服务器权威坐标(EscapeExitPosition / targets / 场景出口)
+        -- 立即直奔电梯：服务器权威坐标(EscapeExitPosition / targets)
         -- 【v16.13】轮询时长 2.4s → 8s，理由同 doVaultDoor：门开后的下发延迟很常见
+        -- 【v16.21】不再使用 F.LastExit 缓存 / scene 兜底当逃离坐标：缓存可能来自
+        -- ExitZone 竖井标记，传进去必然卡死。只认服务器属性与 targets 下发。
         local exit, esrc = readLiftPos()
+        if esrc and tostring(esrc):find("scene", 1, true) then exit, esrc = nil, nil end
         if not exit then
-            for _ = 1, 16 do
+            for _ = 1, 24 do
                 if not F.Enabled or not inEscapeRound() then break end
-                task.wait(0.5)
+                task.wait(0.15)
                 exit, esrc = readLiftPos()
+                if esrc and tostring(esrc):find("scene", 1, true) then exit = nil end
                 if exit then break end
             end
         end
@@ -5750,6 +6944,13 @@ do
         end
         F.LastExit = exitPos
         F.ExitSrc = src
+        -- 【v16.21】不可达坐标黑名单：竖井/墙内/封死区域的坐标传进去会被立刻拉回，
+        -- 旧版会在这里死钉 12 秒（现场表现就是"站着不动"）。5 秒内不再尝试同一坐标。
+        if F.BadExitPos and (F.BadExitPos - exitPos).Magnitude < 8
+            and (os.clock() - (F._badExitAt or 0)) < 5 then
+            F.Phase = "⑤ 该逃离坐标不可达(已跳过)"
+            return false
+        end
         -- 日志节流：坐标变动>2 或距上次>10s 才打印，避免主循环每 tick 刷屏
         if (not F._warnExit) or (F._warnExit - exitPos).Magnitude > 2
             or (os.clock() - (F._warnAt or 0)) > 10 then
@@ -5758,7 +6959,28 @@ do
                 exitPos.X, exitPos.Y, exitPos.Z, src))
         end
         tpSoft(exitPos + Vector3.new(0, 1, 0))
+        -- 可达性验证（0.4s）：若人被拉回 40 studs 外，说明这个坐标根本站不住，
+        -- 立刻拉黑并交回主循环，不再钉 12 秒。
+        do
+            local t0 = os.clock()
+            while os.clock() - t0 < 0.4 do
+                if not F.Enabled then break end
+                if LP:GetAttribute("Escaped") == true then break end
+                task.wait(0.05)
+            end
+            local hrp0 = getHRP()
+            if hrp0 and LP:GetAttribute("Escaped") ~= true
+                and (hrp0.Position - exitPos).Magnitude > 40 then
+                F.BadExitPos, F._badExitAt = exitPos, os.clock()
+                F.LastExit = nil
+                F.Phase = "⑤ 逃离坐标不可达(已拉黑)"
+                warn(string.format("[AUTOESCAPE] 逃离坐标 %.0f,%.0f,%.0f 站不住(被拉回)，已跳过",
+                    exitPos.X, exitPos.Y, exitPos.Z))
+                return false
+            end
+        end
         local start = os.clock()
+        local pulled = 0
         while os.clock() - start < 12 do
             if not F.Enabled then break end
             if LP:GetAttribute("Escaped") == true then break end
@@ -5776,6 +6998,20 @@ do
                     hrp.AssemblyLinearVelocity = Vector3.zero
                 end
             end)
+            -- 连续被拉回 → 该坐标不可站，拉黑退出（别钉死人）
+            do
+                local hrp2 = getHRP()
+                if hrp2 and (hrp2.Position - exitPos).Magnitude > 40 then
+                    pulled = pulled + 1
+                    if pulled >= 6 then
+                        F.BadExitPos, F._badExitAt = exitPos, os.clock()
+                        F.Phase = "⑤ 逃离坐标不可达(已拉黑)"
+                        break
+                    end
+                else
+                    pulled = 0
+                end
+            end
             task.wait(F.Tick)
         end
         return true
@@ -5803,6 +7039,8 @@ do
 
         if not step or not stepText or exitStep then
             local exitPos, esrc = readLiftPos()
+            -- scene 兜底坐标（ExitZone 竖井标记）不可信，直接丢弃等服务器下发
+            if exitPos and esrc and tostring(esrc):find("scene", 1, true) then exitPos = nil end
             if exitPos then
                 F.ExitSrc = esrc or F.ExitSrc
                 doExit(exitPos)
@@ -5815,11 +7053,33 @@ do
         -- 收集各 label 目标（判子阶段用，不依赖系统延迟冒提示）
         local deliverPos = nil
         local driveTargets, lastDrivePos, vaultPcPos = {}, nil, nil
+        local breakers, switchPos = {}, nil
         for _, t in ipairs(targets) do
+            local lb = lo(t.label)
             if t.label == "DELIVER" then deliverPos = t.pos end
             if t.label == "MEMORY DRIVE" then driveTargets[#driveTargets + 1] = t end
             if t.label == "LAST DRIVE" then lastDrivePos = t.pos end
             if t.label == "VAULT PC" then vaultPcPos = t.pos end
+            -- 新版任务：BREAKER ×3 / MAIN SWITCH
+            -- 新版任务第三个「闸门」实际是服务器机柜：targets 用 label=SERVERS 下发，
+            -- 场景里是 Server rack 的 Reboot 互动（路径 ...ServerRack.Black.BreakerPrompt），
+            -- 旧代码只认 BREAKER/VALVE → 第三个永远找不到 → 第二个闸门后站死。
+            if lb:find("breaker", 1, true) or lb:find("valve", 1, true)
+                or lb:find("server", 1, true) or lb:find("rack", 1, true) then
+                breakers[#breakers + 1] = t
+            end
+            if lb:find("switch", 1, true) or lb:find("main", 1, true) then switchPos = t.pos end
+        end
+
+        -- 新版任务：Reset the 3 breakers / Throw the main switch at the vault
+        if stepText:find("breaker", 1, true) or stepText:find("valve", 1, true) then
+            F.Current = "复位断路器"
+            doBreakers(breakers)
+            return
+        end
+        if stepText:find("switch", 1, true) and not stepText:find("key", 1, true) then
+            doMainSwitch(switchPos, stepText)
+            return
         end
 
         if stepText:find("wake scp", 1, true) then
@@ -5934,19 +7194,23 @@ do
             else
                 F.Phase = "生存模式(非逃脱)"
             end
-        elseif phase == "Intermission" or phase == "Lobby" then
+        elseif phase == "Intermission" or phase == "Lobby" or phase == "Results" then
             F.VotedThisPhase = false
             F.CountedThisRound = false
             F.Current = "无"
             F.Targets = 0
             -- v16.13：回合结束清空本地完成标记，新一局同文本步骤不能被误跳过
             F.LocalDone = {}
+            F.BreakerDone = {}
+            F.BreakerMiss = {}
             F.LastExit = nil
             F.ExitSrc = "无"
             F._exitScanPos = nil
             F._exitScanAt = -10
             F._warnExit = nil
-            F.Phase = phase == "Lobby" and "大厅" or "局间休息"
+            F.BadExitPos, F._badExitAt = nil, 0
+            F.LastDoorPos = nil
+            F.Phase = (phase == "Lobby") and "大厅" or ((phase == "Results") and "回合结算" or "局间休息")
         end
     end
 
@@ -5958,11 +7222,16 @@ do
         local gen = F.Gen
         -- 每次开启视为新一局：本地完成标记必须清空，否则上局「金库门」会被永久跳过
         F.LocalDone = {}
+        F.BreakerDone = {}          -- 闸门/机柜复位记录也必须按局清空，否则同位置面板被误跳过
+        F.BreakerMiss = {}
+        F._breakerScanAt = 0
         F.LastExit = nil
         F.ExitSrc = "无"
         F._exitScanPos = nil
         F._exitScanAt = -10
         F._warnExit = nil
+        F.BadExitPos, F._badExitAt = nil, 0
+        F.LastDoorPos = nil
         F.Conn = RS:GetAttributeChangedSignal("RoundPhase"):Connect(onPhase)
         pcall(onPhase)
         -- 常驻主循环：跨回合持续运行，回合切换不会杀死协程
@@ -5976,6 +7245,8 @@ do
                             F.CountedThisRound = true
                             F.Escapes = F.Escapes + 1
                         end
+                        F.Phase = "已逃脱"
+                        F.Current = "无"
                     elseif inEscapeRound() then
                         pcall(doEscape)
                     end
@@ -6012,6 +7283,38 @@ do
     F.SetStallSec = function(v) if type(v) == "number" then F.StallSec = math.max(2, v) end; return F.StallSec end
     F.SetHideDepth = function(v) if type(v) == "number" then F.HideDepth = math.max(3, v) end; return F.HideDepth end
     F.VoteNow = function() return voteEscape() end
+    -- 【诊断】闸门任务卡住时执行：AUTOESCAPE_DUMP()
+    -- 会列出所有 reset/breaker/valve 类 PP（含 enabled、坐标、父路径）与当前清单/targets、
+    -- 以及本地已复位的闸门坐标，用来确认第三个闸门到底是「PP 不存在」「PP 已 disabled」
+    -- 还是「坐标根本不是这个点」。
+    F.DumpBreakers = function()
+        local out = { "=== 闸门/阀门诊断 ===" }
+        local steps = readChecklist() or {}
+        for _, s in ipairs(steps) do
+            out[#out + 1] = string.format("步骤 done=%s | %s | %s",
+                tostring(s.done), tostring(s.text), tostring(s.detail))
+        end
+        out[#out + 1] = "Phase=" .. tostring(F.Phase) .. " Current=" .. tostring(F.Current)
+        local bd = {}
+        for k in pairs(F.BreakerDone or {}) do bd[#bd + 1] = tostring(k) end
+        out[#out + 1] = "本地已复位=" .. table.concat(bd, ",")
+        for _, p in ipairs(scanAllPPs(true)) do
+            local a, o = p.action or "", p.obj or ""
+            if a:find("reset", 1, true) or a:find("breaker", 1, true)
+                or a:find("valve", 1, true) or a:find("flip", 1, true)
+                or o:find("breaker", 1, true) or o:find("valve", 1, true) then
+                out[#out + 1] = string.format("PP [%s|%s] enabled=%s pos=%s par=%s",
+                    a, o, tostring(p.enabled),
+                    p.pos and string.format("%.0f,%.0f,%.0f", p.pos.X, p.pos.Y, p.pos.Z) or "nil",
+                    p.pp.Parent and p.pp.Parent:GetFullName() or "?")
+            end
+        end
+        for _, t in ipairs(readTargets()) do
+            out[#out + 1] = string.format("target %s @ %.0f,%.0f,%.0f",
+                tostring(t.label), t.pos.X, t.pos.Y, t.pos.Z)
+        end
+        return table.concat(out, "\n")
+    end
     F.Dump = function()
         local targets = readTargets()
         local tlist = {}
@@ -6054,6 +7357,7 @@ do
         if _G and _G ~= G then envs[#envs + 1] = _G end
         for _, e in ipairs(envs) do
             e.AUTOESCAPE_DUMP = function() print(F.Dump()) end
+            e.GATE_DUMP = function() print(F.DumpBreakers()) end
             e.AUTOESCAPE_VOTE = function() return F.VoteNow() end
         end
     end)
@@ -6062,568 +7366,1880 @@ do
 end
 end
 
--- 全自动挂机 AUTOFARM v1.2
+-- ==========
+do
+  if G.AUTOFARM and G.AUTOFARM.Off then pcall(function() G.AUTOFARM.Off() end) end
+  G.AUTOFARM = nil
+
+  local LP  = PlayersSvc.LocalPlayer
+  local WS  = game:GetService("Workspace")
+  local RS  = game:GetService("ReplicatedStorage")
+  local RUS = game:GetService("RunService")
+
+  local F = {
+    Enabled   = false,
+    AutoVote  = true,
+    AutoLoot  = true,
+    AutoRoof  = true,
+    AutoClaim = true,
+    AutoEscape = true,
+    ClaimEvery = 0.5,   -- 无奖励时的轮询间隔（秒）。检测到可领会立即领取并级联复查
+    ClaimBurst = true,  -- 领到奖励后立刻连查，直到无可领
+    Claiming  = false,  -- 防重入锁
+    _lastClaimPhase = nil,
+    Phase     = "待命（默认关闭）",
+    Mode      = "无",
+    Crates    = 0,
+    Looted    = 0,
+    Looting   = false,
+    LootedRound = false,
+    LastCrate = "无",
+    Votes     = 0,
+    LastVote  = "无",
+    Claims    = 0,
+    AchClaims = 0,   -- 成就奖励累计领取次数
+    _achSig   = nil, -- 成就数据签名（仅变化时全扫，防高频空转）
+    _achSigT  = 0,   -- 上次成就全扫时间（4 秒兜底）
+    LastClaim = "无",
+    Conn      = nil,
+    ModeConn  = nil,
+    ClaimConn = nil,
+  }
+  G.AUTOFARM = F
+
+  local FPP = (getgenv and getgenv().fireproximityprompt) or _G.fireproximityprompt
+  local function lo(s) return string.lower(tostring(s or "")) end
+
+  local function getHRP()
+    local ch = LP and LP.Character
+    return ch and ch:FindFirstChild("HumanoidRootPart") or nil
+  end
+  local function getHum()
+    local ch = LP and LP.Character
+    return ch and ch:FindFirstChildOfClass("Humanoid") or nil
+  end
+
+  local function tp(pos)
+    local ch = LP and LP.Character
+    if not ch then return false end
+    local ok = pcall(function()
+      if ch.PivotTo then
+        ch:PivotTo(CFrame.new(pos))
+      else
+        local hrp = ch:FindFirstChild("HumanoidRootPart")
+        if hrp then hrp.CFrame = CFrame.new(pos) end
+      end
+    end)
+    return ok
+  end
+
+  local function isCratePP(x)
+    if not x then return false end
+    local ok, isCrate = pcall(function()
+      if not x:IsA("ProximityPrompt") then return false end
+      if not x.Enabled then return false end
+      local obj = lo(x.ObjectText)
+      local act = lo(x.ActionText)
+      if string.find(obj, "door", 1, true) then return false end
+      if string.find(act, "close", 1, true) then return false end
+      local opens = string.find(act, "open", 1, true)
+        or string.find(act, "search", 1, true)
+        or string.find(act, "loot", 1, true)
+      if not opens then return false end
+      local hasCrate  = string.find(obj, "crate", 1, true) ~= nil
+      local hasSupply = string.find(obj, "supply", 1, true) ~= nil
+      return hasCrate or hasSupply
+    end)
+    return ok and isCrate == true
+  end
+
+  local function ppWorld(x)
+    local w
+    pcall(function()
+      local p = x.Parent
+      if p and p:IsA("Attachment") then w = p.WorldPosition
+      elseif p and p:IsA("BasePart") then w = p.Position
+      elseif p and p.Parent and p.Parent:IsA("BasePart") then w = p.Parent.Position end
+    end)
+    return w
+  end
+
+  local function firePrompt(pp)
+    pcall(function()
+      if FPP then FPP(pp, 0.01, true)
+      else
+        pp:InputHoldBegin()
+        task.delay(0.05, function() pcall(function() pp:InputHoldEnd() end) end)
+      end
+    end)
+  end
+
+-- ==========
+  local function voteOne(want)
+    local ok = false
+    pcall(function()
+      local remotes = RS:FindFirstChild("Remotes")
+      local rv = remotes and remotes:FindFirstChild("RoundVote")
+      if rv then
+        rv:FireServer(want)
+        F.Votes = F.Votes + 1
+        F.LastVote = want
+        ok = true
+      end
+    end)
+    return ok, want
+  end
+  local function voteRound()
+    return voteOne((F.AutoEscape and "Escape") or "Survival")
+  end
+
+-- ==========
+  local function escapeEngine() return G.AUTOESCAPE end
+
+  local function setEscape(on)
+    local e = escapeEngine()
+    if not e then return false end
+    if on then
+      if not e.Enabled then e.SetEnabled(true) end
+    else
+      if e.Enabled then e.SetEnabled(false) end
+    end
+    return true
+  end
+
+  local function shouldEscape()
+    if not F.AutoEscape then return false end
+    if RS:GetAttribute("RoundMode") ~= "Escape" then return false end
+    if RS:GetAttribute("RoundPhase") ~= "Playing" then return false end
+    if LP:GetAttribute("InRound") ~= true then return false end
+    if LP:GetAttribute("Role") == "SCP" then return false end
+    if LP:GetAttribute("Ghost") == true then return false end
+    return true
+  end
+
+-- ==========
+  local function scanCrates()
+    local list = {}
+    for _, x in ipairs(WS:GetDescendants()) do
+      if isCratePP(x) then
+        local w = ppWorld(x)
+        if w then list[#list + 1] = { pp = x, w = w } end
+      end
+    end
+    F.Crates = #list
+    return list
+  end
+
+  local function lootOne(c)
+    local pp, w = c.pp, c.w
+    if not isCratePP(pp) then return false end
+    tp(w + Vector3.new(0, 1.6, 0))
+    task.wait(0.08)
+    firePrompt(pp)
+    for _ = 1, 3 do
+      task.wait(0.15)
+      if not pp.Parent then return true end
+      if not pp.Enabled then return true end
+      firePrompt(pp)
+    end
+    pcall(function()
+      local hum = getHum()
+      if hum then hum:MoveTo(w) end
+    end)
+    task.wait(0.22)
+    if pp.Parent and pp.Enabled then firePrompt(pp) end
+    task.wait(0.18)
+    return (not pp.Parent) or (not pp.Enabled)
+  end
+
+  local function lootCrates()
+    local t0 = os.clock()
+    local crates = scanCrates()
+    F.Looted = 0
+    if #crates == 0 then
+      F.Phase = "无箱可捡"
+      return 0
+    end
+    for i, c in ipairs(crates) do
+      if not F.Enabled or not F.Looting then break end
+      if isCratePP(c.pp) then
+        F.Phase = string.format("捡箱 %d/%d", i, #crates)
+        if lootOne(c) then
+          F.Looted = F.Looted + 1
+        end
+        F.LastCrate = string.format("(%.0f,%.0f,%.0f)",
+          c.w.X, c.w.Y, c.w.Z)
+      end
+    end
+    F.Phase = string.format("捡箱完成 %d/%d · 用时 %.1fs",
+      F.Looted, #crates, os.clock() - t0)
+    return F.Looted
+  end
+
+-- ==========
+  local function findRoof()
+    local best, bestTop = nil, -math.huge
+    for _, p in ipairs(WS:GetDescendants()) do
+      if p:IsA("BasePart") then
+        local nm = lo(p.Name)
+        if string.find(nm, "roof", 1, true) or string.find(nm, "ceiling", 1, true) then
+          local top = p.Position.Y + p.Size.Y / 2
+          if top > bestTop then bestTop = top; best = p end
+        end
+      end
+    end
+    return best, bestTop
+  end
+
+  local function gotoRoof()
+    local roof, top = findRoof()
+    if not roof then
+      F.Phase = "无天花板"
+      return false
+    end
+    local target = roof.Position + Vector3.new(0, roof.Size.Y / 2 + 5, 0)
+    local ok = tp(target)
+    if ok then F.Phase = "已传天花板" end
+    return ok
+  end
+
+-- ==========
+  -- 成就奖励（MISSIONS → ACHIEVEMENTS）：实测接口 ClaimAchievement(key)，服务器判定可领返回 true
+  local ACH_KEYS = {
+    "Streak","Played","Spec939","Research","Escapes","SCPKills","Alive",
+    "Emotes","Level","SCPRounds","Slides","Spec049","SCPWins","Doors",
+    "Crates","Quests","Lifer","Spec096","Survive",
+  }
+  local ACH_SIG_KEYS = {"Wins","Escapes","Level","QuestsDone","RoundsPlayed","SCPWins",
+    "BestStreak","Crates","Doors","Slides","SurviveSeconds","RoundsSurvived","SCPKills"}
+  local function achSignature(state)
+    if type(state) ~= "table" or type(state.Mission) ~= "table" then return "" end
+    local parts = {}
+    -- 覆盖全部字段，任何成就对应统计一变就立即触发
+    local ach = state.Mission.Ach or {}
+    for k, v in pairs(ach) do parts[#parts + 1] = "a" .. tostring(k) .. "=" .. tostring(v) end
+    local val = state.Mission.Values or {}
+    for k, v in pairs(val) do parts[#parts + 1] = "v" .. tostring(k) .. "=" .. tostring(v) end
+    table.sort(parts)
+    return table.concat(parts, "|")
+  end
+
+  local function claimRewards()
+    local ok, res = pcall(function()
+      local remotes = RS:FindFirstChild("Remotes")
+      local rr = remotes and remotes:FindFirstChild("RewardsRequest")
+      if not rr then return nil end
+      local a, b, state = rr:InvokeServer("Snapshot")
+      return { rr = rr, state = state }
+    end)
+    if not ok or not res then return 0, "无RewardsRequest" end
+    local rr, state = res.rr, res.state
+    if type(state) ~= "table" or state.Loaded ~= true then return 0, "未加载" end
+    local n = 0
+    local what = {}
+    if state.CanClaim == true then
+      pcall(function() rr:InvokeServer("ClaimDaily", nil) end)
+      n = n + 1; what[#what + 1] = "每日"
+    end
+    if type(state.Quests) == "table" then
+      for i, q in ipairs(state.Quests) do
+        if type(q) == "table" and q.Claimed ~= true and (q.Progress or 0) >= (q.Target or 0) then
+          pcall(function() rr:InvokeServer("ClaimQuest", i) end)
+          n = n + 1; what[#what + 1] = "任务" .. i
+        end
+      end
+    end
+    -- 时长奖励（已按用户要求关闭，不再领取）
+    -- 成就奖励：签名变化立即全扫；4 秒兜底全扫，防止服务器 Snapshot 缓存延迟导致漏领
+    local sig = achSignature(state)
+    local nowt = tick()
+    local due = (nowt - (F._achSigT or 0)) >= 4
+    if sig ~= "" and (due or sig ~= F._achSig) then
+      for _, k in ipairs(ACH_KEYS) do
+        task.wait(0.03)
+        local okc, got = pcall(function() return rr:InvokeServer("ClaimAchievement", k) end)
+        if okc and got == true then
+          n = n + 1
+          F.AchClaims = F.AchClaims + 1
+          what[#what + 1] = "成就:" .. k
+        end
+      end
+      F._achSig = sig
+      F._achSigT = nowt
+    end
+    if n > 0 then
+      F.Claims = F.Claims + n
+      F.LastClaim = table.concat(what, ",")
+    end
+    return n, table.concat(what, ",")
+  end
+
+  -- 智能领奖：检测到可领立即申请，并级联复查直到清空（事件驱动、不再干等20秒）
+  local function claimSmart()
+    if F.Claiming then return 0, "领奖中" end
+    F.Claiming = true
+    local total, allWhat = 0, {}
+    local guard = 0
+    local ok = true
+    while ok and guard < 12 do
+      guard = guard + 1
+      local n, what = claimRewards()
+      if n and n > 0 then
+        total = total + n
+        if what and what ~= "" then allWhat[#allWhat + 1] = what end
+        if F.ClaimBurst then
+          task.wait(0.4)  -- 给服务器结算时间后立刻复查
+        else
+          ok = false
+        end
+      else
+        ok = false
+      end
+    end
+    F.Claiming = false
+    if total > 0 then
+      F.Phase = "领奖：+" .. tostring(total) .. " " .. table.concat(allWhat, ",")
+    end
+    return total, table.concat(allWhat, ",")
+  end
+
+  -- 有奖励信号时立刻领：回合结算 / 玩家属性变化都会调用
+  local claimDebounce = 0
+  local function fastClaim(reason)
+    if not F.Enabled or not F.AutoClaim then return end
+    local now = tick()
+    if now - claimDebounce < 0.5 then return end  -- 防抖，避免同一信号重复触发
+    claimDebounce = now
+    task.spawn(function()
+      task.wait(0.5)  -- 稍等服务器把奖励状态落定
+      if F.Enabled and F.AutoClaim then
+        local n = claimSmart()
+        if n > 0 then F.LastClaim = F.LastClaim .. " [" .. tostring(reason or "事件") .. "]" end
+      end
+    end)
+  end
+
+-- ==========
+  local function onPhase()
+    if not F.Enabled then return end
+    local phase = RS:GetAttribute("RoundPhase")
+    local mode  = RS:GetAttribute("RoundMode")
+
+    if phase == "Voting" then
+      F.Mode = "投票"
+      F.LootedRound = false
+      if F.AutoVote and not F.VotedThisPhase then
+        F.VotedThisPhase = true
+        task.spawn(function()
+          task.wait(0.6)
+          local ok, want = voteRound()
+          F.Phase = ok and ("已投 " .. tostring(want)) or "投票失败"
+        end)
+      elseif not F.AutoVote then
+        F.Phase = "投票中(不自动投票)"
+      end
+    elseif phase == "Playing" then
+      F.VotedThisPhase = false
+      F.Mode = tostring(mode or "?")
+      if mode == "Escape" then
+-- ==========
+        if LP:GetAttribute("Role") == "SCP" or LP:GetAttribute("Ghost") == true then
+          F.Looting = false
+          setEscape(false)
+          F.Phase = "任务模式：本局你是 SCP/旁观"
+        elseif F.Looting then
+          F.Phase = "任务模式：捡箱中（捡完自动交权）"
+        elseif F.AutoLoot and not F.LootedRound then
+          local e = escapeEngine()
+          if e and e.Enabled then
+            F.LootedRound = true
+            F.Phase = "任务模式：逃脱进行中(跳过捡箱)"
+          else
+            F.Looting = true
+            F.Phase = "任务模式：先捡箱"
+            task.spawn(function()
+              local n = lootCrates()
+              F.LootedRound = true
+              F.Looting = false
+              if not F.Enabled then return end
+              if shouldEscape() then
+                if setEscape(true) then
+                  F.Phase = string.format("任务模式：捡箱%d个 → 自动逃脱", n)
+                else
+                  F.Phase = "任务模式：缺少 AUTOESCAPE 引擎"
+                end
+              else
+                F.Phase = "任务模式：未参与(旁观/已逃脱)"
+              end
+            end)
+          end
+        elseif shouldEscape() then
+          F.Phase = "任务模式：自动逃脱"
+          if not setEscape(true) then
+            F.Phase = "任务模式：缺少 AUTOESCAPE 引擎"
+          end
+        else
+          setEscape(false)
+          F.Phase = "任务模式：未参与(旁观/已逃脱)"
+        end
+      else
+-- ==========
+        setEscape(false)
+        if F.AutoLoot and not F.Looting then
+          F.Looting = true
+          task.spawn(function()
+            F.Phase = "开始捡箱"
+            lootCrates()
+            if F.Enabled and F.AutoRoof then
+              local hunt = G.STAFFHUNT
+              if hunt and hunt.HasTarget and hunt.HasTarget() then
+                F.Phase = "发现特殊研究员：跳过躲藏"
+              else
+                gotoRoof()
+              end
+            end
+            F.Looting = false
+            if F.Enabled and F.Phase ~= "已传天花板" then
+              F.Phase = "挂机中"
+            end
+          end)
+        end
+      end
+    elseif phase == "Intermission" or phase == "Lobby" or phase == "Results" then
+      F.Looting = false
+      F.VotedThisPhase = false
+      F.Crates, F.Looted = 0, 0
+      F.LootedRound = false
+      F.Mode = "无"
+      setEscape(false)
+      F.Phase = (phase == "Lobby") and "大厅" or ((phase == "Results") and "回合结算" or "局间休息")
+    end
+  end
+
+  local function start()
+    if F.Conn then return end
+    F.Conn = RS:GetAttributeChangedSignal("RoundPhase"):Connect(onPhase)
+    F.ModeConn = RS:GetAttributeChangedSignal("RoundMode"):Connect(onPhase)
+    pcall(onPhase)
+    if F.AutoClaim then
+      F.ClaimConn = task.spawn(function()
+        while G.AUTOFARM == F do
+          task.wait(F.ClaimEvery)
+          if F.Enabled and F.AutoClaim and not F.Claiming then
+            pcall(claimSmart)
+          end
+        end
+      end)
+      -- 回合/模式变化时立即检测奖励（结算常在此刻发生）
+      F.RewardConn = RS:GetAttributeChangedSignal("RoundPhase"):Connect(function()
+        task.spawn(function() task.wait(1.2); fastClaim("回合结算") end)
+      end)
+      -- 玩家奖励属性变化时立即领
+      pcall(function()
+        F.RewardAttrConn = LP:GetAttributeChangedSignal("RewardReady"):Connect(function()
+          fastClaim("奖励属性")
+        end)
+      end)
+    end
+  end
+  local function stop()
+    setEscape(false)
+    if F.Conn then pcall(function() F.Conn:Disconnect() end) end
+    if F.ModeConn then pcall(function() F.ModeConn:Disconnect() end) end
+    if F.RewardConn then pcall(function() F.RewardConn:Disconnect() end) end
+    if F.RewardAttrConn then pcall(function() F.RewardAttrConn:Disconnect() end) end
+    F.Conn = nil
+    F.ModeConn = nil
+    F.RewardConn = nil
+    F.RewardAttrConn = nil
+    F.Looting = false
+  end
+
+-- ==========
+  F.SetEnabled = function(v)
+    F.Enabled = v and true or false
+    if F.Enabled then
+      start()
+      F.Phase = "运行中"
+      warn("[AUTOFARM] 已开启：投票(生存/逃脱) + 捡箱(生存局+逃脱局·互动完立刻下一个) + 任务模式自动逃脱 + 领奖励")
+    else
+      stop()
+      F.Phase = "待命（已关闭）"
+      warn("[AUTOFARM] 已关闭")
+    end
+    return F.Enabled
+  end
+  F.SetAutoVote  = function(v) F.AutoVote = v and true or false; return F.AutoVote end
+  F.SetAutoLoot  = function(v) F.AutoLoot = v and true or false; return F.AutoLoot end
+  F.SetAutoRoof  = function(v) F.AutoRoof = v and true or false; return F.AutoRoof end
+  F.SetAutoClaim = function(v)
+    F.AutoClaim = v and true or false
+    if F.AutoClaim then
+      if F.Enabled then
+        if not F.ClaimConn then start() end  -- 确保协程和事件已挂
+        fastClaim("开启自动领奖")
+      end
+    end
+    return F.AutoClaim
+  end
+  F.SetClaimEvery = function(sec)
+    sec = tonumber(sec)
+    if sec and sec >= 0.5 then F.ClaimEvery = sec end
+    return F.ClaimEvery
+  end
+  F.SetAutoEscape = function(v)
+    F.AutoEscape = v and true or false
+    if not F.AutoEscape then setEscape(false) end
+    return F.AutoEscape
+  end
+  F.EscapeNow = function()
+    if not escapeEngine() then return false, "缺少 AUTOESCAPE 引擎" end
+    if not setEscape(true) then return false, "引擎启动失败" end
+    F.Phase = "任务模式：手动逃脱"
+    return true
+  end
+  F.StopEscape = function() setEscape(false); return true end
+  F.ClaimNow = function()
+    local n, what = claimSmart()
+    if n <= 0 then F.Phase = "领奖：无可领" end
+    return n, what
+  end
+  F.LootNow = function()
+    if F.Looting then return 0, "正在捡" end
+    F.Looting = true
+    task.spawn(function()
+      lootCrates()
+      F.Looting = false
+    end)
+    return F.Crates
+  end
+  F.GotoRoofNow = function() return gotoRoof() end
+  F.VoteNow = function() return voteRound() end
+  F.Dump = function()
+    local e = escapeEngine()
+    local esc = "无"
+    if e then
+      esc = string.format("Enabled=%s Phase=%s Current=%s 累计逃脱=%s",
+        tostring(e.Enabled), tostring(e.Phase), tostring(e.Current), tostring(e.Escapes))
+    end
+    return table.concat({
+      "=== AUTOFARM v1.3 Dump ===",
+      "Enabled=" .. tostring(F.Enabled) .. " Phase=" .. tostring(F.Phase)
+        .. " Mode=" .. tostring(F.Mode),
+      "AutoVote=" .. tostring(F.AutoVote) .. " AutoLoot=" .. tostring(F.AutoLoot)
+        .. " AutoRoof=" .. tostring(F.AutoRoof) .. " AutoClaim=" .. tostring(F.AutoClaim)
+        .. " AutoEscape=" .. tostring(F.AutoEscape)
+        .. " ClaimEvery=" .. tostring(F.ClaimEvery) .. " ClaimBurst=" .. tostring(F.ClaimBurst)
+        .. " Claiming=" .. tostring(F.Claiming),
+      "本轮扫箱=" .. tostring(F.Crates) .. " 已开=" .. tostring(F.Looted)
+        .. " 本局已捡=" .. tostring(F.LootedRound) .. " 最近=" .. tostring(F.LastCrate),
+      "累计投票=" .. tostring(F.Votes) .. "(最近 " .. tostring(F.LastVote) .. ")"
+        .. " 累计领奖=" .. tostring(F.Claims) .. " 成就领=" .. tostring(F.AchClaims)
+        .. " 最近=" .. tostring(F.LastClaim),
+      "RoundMode=" .. tostring(RS:GetAttribute("RoundMode"))
+        .. " RoundPhase=" .. tostring(RS:GetAttribute("RoundPhase")),
+      "任务逃脱引擎: " .. esc,
+    }, "\n")
+  end
+  F.Off = function()
+    F.Enabled = false
+    stop()
+    if F.ClaimConn then pcall(function() task.cancel(F.ClaimConn) end) end
+    F.ClaimConn = nil
+    G.AUTOFARM = nil
+  end
+
+  pcall(function()
+    local envs = { G }
+    if _G and _G ~= G then envs[#envs + 1] = _G end
+    for _, e in ipairs(envs) do
+      e.AUTOFARM_DUMP  = function() print(F.Dump()) end
+      e.AUTOFARM_CLAIM = function() return F.ClaimNow() end
+      e.AUTOFARM_LOOT  = function() return F.LootNow() end
+      e.AUTOFARM_ROOF  = function() return F.GotoRoofNow() end
+      e.AUTOFARM_VOTE  = function() return F.VoteNow() end
+      e.AUTOFARM_ESCAPE = function() return F.EscapeNow() end
+    end
+  end)
+
+  print("[AUTOFARM] 已加载 v1.3 · 全自动挂机(投票/捡箱[生存+逃脱·互动完立刻下一个]/任务逃脱/领奖励) · 默认关闭 · AUTOFARM_DUMP()")
+end
+
+-- ==========
+-- ==========
+-- ==========
+do
+  if G.STAFFHUNT and G.STAFFHUNT.Off then pcall(function() G.STAFFHUNT.Off() end) end
+  G.STAFFHUNT = nil
+
+  local CS = game:GetService("CollectionService")
+  local SG = game:GetService("StarterGui")
+  local RS2 = game:GetService("ReplicatedStorage")
+  local LP = PlayersSvc.LocalPlayer
+
+  local H = {
+    Enabled      = false,
+    AutoTP       = true,
+    AutoWatch    = true,
+    ShowNormal   = false,
+    ScanInterval = 0.5,
+    FirstTPDist  = 45,
+    SafeDist     = 10,
+    TeleportCD   = 2.5,
+    MaxTPPerTarget = 8,
+    TPInEscape   = false,
+    WatchSeconds = 4,
+    MaxLabelDist = 2000,
+    FillAlpha    = 0.5,
+    derived  = {},
+    known    = {},
+    conn     = nil,
+    watchConn= nil,
+    scanAt   = 0,
+    label    = nil,
+    status   = "待命",
+    target   = nil,
+    tpCount  = 0,
+    nextTP   = 0,
+    lastTP   = "无",
+    tpTotal  = 0,
+    Counts   = { special = 0, abnormal = 0, normal = 0 },
+    ownerAssets = {},
+    playerAssets = {},
+    playerNames = {},
+    assetAt = 0,
+  }
+  G.STAFFHUNT = H
+
+  local KNOWN_ROLES  = { Guard = true, Scientist = true, Janitor = true }
+  local KNOWN_PREFIX = { Guard = true, Janitor = true, Researcher = true }
+  local KEYWORDS = { "owner", "doppel", "avatar", "cameo", "dev", "special",
+           "unique", "badge", "selfinsert", "self_insert" }
+
+  local ASSET_FIELDS = { "Head", "Face", "Shirt", "Pants", "GraphicTShirt",
+             "Torso", "LeftArm", "RightArm", "LeftLeg", "RightLeg" }
+
+  local OWNER_IDS = {
+    [136280735368962] = "Buffer.Head",
+    [7049758241]      = "Buffer.Shirt",
+    [7156542047]      = "Buffer.Pants",
+    [101490994547910] = "Zion.Head",
+    [110376114001169] = "Zion.Shirt",
+    [116139827578394] = "Zion.Pants",
+    [113567168434076] = "Zion.Torso",
+    [84780766579093]  = "Zion.LeftArm",
+    [78241712099906]  = "Zion.RightArm",
+    [94305080976284]  = "Zion.LeftLeg",
+  }
+  for k, v in pairs(OWNER_IDS) do H.ownerAssets[k] = v end
+
+  local OWNER_USERS = { 4891465608, 9237209883 }
+
+  local function attrsOf(m)
+    local t = {}
+    for k, v in pairs(m:GetAttributes()) do
+      t[#t + 1] = tostring(k) .. "=" .. tostring(v)
+    end
+    return t
+  end
+
+  local function headOf(m)
+    return m:FindFirstChild("Head") or m.PrimaryPart
+      or m:FindFirstChild("HumanoidRootPart") or m:FindFirstChild("Torso")
+  end
+
+  local function myRoot()
+    local ch = LP and LP.Character
+    return ch and (ch.PrimaryPart or ch:FindFirstChild("HumanoidRootPart") or nil)
+  end
+
+  local function assetsOf(m)
+    local hd = nil
+    for _, d in ipairs(m:GetDescendants()) do
+      if d:IsA("HumanoidDescription") then hd = d break end
+    end
+    if not hd then return nil, {} end
+    local ids = {}
+    for _, f in ipairs(ASSET_FIELDS) do
+      local ok, v = pcall(function() return hd[f] end)
+      if ok and type(v) == "number" and v ~= 0 then
+        ids[#ids + 1] = v
+      end
+    end
+    return hd, ids
+  end
+
+  local function refreshAssets()
+    local now = os.clock()
+    if now - H.assetAt < 60 then return end
+    H.assetAt = now
+
+    task.spawn(function()
+      for _, uid in ipairs(OWNER_USERS) do
+        local ok, d = pcall(function()
+          return PlayersSvc:GetHumanoidDescriptionFromUserId(uid)
+        end)
+        if ok and d then
+          for _, f in ipairs(ASSET_FIELDS) do
+            local ok2, v = pcall(function() return d[f] end)
+            if ok2 and type(v) == "number" and v ~= 0 then
+              H.ownerAssets[v] = (f == "Head" and "作者.Head" or "作者." .. f)
+            end
+          end
+        end
+      end
+
+      local names = {}
+      for _, p in ipairs(PlayersSvc:GetPlayers()) do
+        local nm = string.lower(p.Name)
+        names[nm] = true
+        local dn = string.lower(p.DisplayName or "")
+        if #dn >= 4 then names[dn] = true end
+
+        if not H.playerAssets[p.UserId] then
+          local ok, d = pcall(function()
+            return PlayersSvc:GetHumanoidDescriptionFromUserId(p.UserId)
+          end)
+          if ok and d then
+            local set = {}
+            for _, f in ipairs(ASSET_FIELDS) do
+              local ok2, v = pcall(function() return d[f] end)
+              if ok2 and type(v) == "number" and v ~= 0 then set[v] = true end
+            end
+            H.playerAssets[p.UserId] = set
+          end
+        end
+      end
+      H.playerNames = names
+    end)
+  end
+
+  local function classify(m)
+    local strong, weak = {}, {}
+    local function S1(x) strong[#strong + 1] = x end
+    local function W1(x) weak[#weak + 1] = x end
+
+    local hd, ids = assetsOf(m)
+    if hd and #ids > 0 then
+      local hitOwner, hitPlayerUid = nil, nil
+      for _, id in ipairs(ids) do
+        if H.ownerAssets[id] then hitOwner = H.ownerAssets[id] end
+        for uid, set in pairs(H.playerAssets) do
+          if set[id] then hitPlayerUid = uid end
+        end
+      end
+      if hitOwner then
+        S1("★作者头像 " .. hitOwner .. "（资产" .. #ids .. "项）")
+      elseif hitPlayerUid then
+        S1("★复刻玩家 UID=" .. tostring(hitPlayerUid) .. "（资产" .. #ids .. "项）")
+      else
+        S1("描述带资产×" .. #ids)
+      end
+    end
+
+    for k, v in pairs(m:GetAttributes()) do
+      local hay = string.lower(tostring(k)) .. "=" .. string.lower(tostring(v))
+      for _, kw in ipairs(KEYWORDS) do
+        if string.find(hay, kw, 1, true) then
+          S1(tostring(k) .. "=" .. tostring(v))
+          break
+        end
+      end
+    end
+
+    local role = m:GetAttribute("StaffRole")
+    if role == nil then S1("无StaffRole")
+    elseif not KNOWN_ROLES[role] then S1("StaffRole=" .. tostring(role)) end
+
+    if m:GetAttribute("Staff") ~= true then S1("Staff≠true") end
+
+    local hum = m:FindFirstChildOfClass("Humanoid")
+    if hum and hum.RigType ~= Enum.HumanoidRigType.R6 then W1("R15") end
+    if m:GetAttribute("StaffArchetype") == nil then W1("无StaffArchetype") end
+
+    local pfx = string.match(m.Name, "^(%a+)")
+    if pfx and not KNOWN_PREFIX[pfx] then W1("名前缀=" .. pfx) end
+
+    local lname = string.lower(m.Name)
+    for _, kw in ipairs({ "buffer", "zion" }) do
+      if string.find(lname, kw, 1, true) then W1("名字含作者名") break end
+    end
+    if H.playerNames[lname] then
+      W1("名字=在场玩家")
+    else
+      for nm in pairs(H.playerNames) do
+        if #nm >= 4 and string.sub(lname, -#nm) == nm then
+          W1("名字以玩家名结尾")
+          break
+        end
+      end
+    end
+
+    if #strong > 0 then return 2, table.concat(strong, " · ") end
+    if #weak > 0 then return 1, table.concat(weak, " · ") end
+    return 0, ""
+  end
+
+  local function colorOf(tier)
+    if tier == 2 then return Color3.fromRGB(255, 55, 55) end
+    if tier == 1 then return Color3.fromRGB(255, 150, 40) end
+    return Color3.fromRGB(90, 220, 140)
+  end
+
+  local function makeEntry(m, tier, reason)
+    local c = colorOf(tier)
+    local hl = Instance.new("Highlight")
+    hl.Name = "StaffHunt_HL"
+    hl.Adornee = m
+    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    hl.FillColor = c
+    hl.FillTransparency = H.FillAlpha
+    hl.OutlineColor = c
+    hl.OutlineTransparency = 0
+    hl.Parent = m
+
+    if not headOf(m) then
+      return { hl = hl, gui = nil, label = nil, tier = tier, reason = reason }
+    end
+
+    local bb = Instance.new("BillboardGui")
+    bb.Name = "StaffHunt_Tag"
+    bb.Adornee = m
+    bb.Size = UDim2.new(0, 250, 0, 44)
+    bb.StudsOffset = Vector3.new(0, 3.2, 0)
+    bb.AlwaysOnTop = true
+    bb.MaxDistance = H.MaxLabelDist
+    bb.LightInfluence = 0
+    bb.Parent = m
+
+    local txt = Instance.new("TextLabel")
+    txt.Size = UDim2.new(1, 0, 1, 0)
+    txt.BackgroundTransparency = 1
+    txt.Font = Enum.Font.GothamBold
+    txt.TextSize = 13
+    txt.TextStrokeTransparency = 0.4
+    txt.TextColor3 = c
+    txt.Text = ""
+    txt.Parent = bb
+
+    return { hl = hl, gui = bb, label = txt, tier = tier, reason = reason }
+  end
+
+  local function destroyEntry(m)
+    local e = H.derived[m]
+    if not e then return end
+    if e.hl and e.hl.Parent then pcall(function() e.hl:Destroy() end) end
+    if e.gui and e.gui.Parent then pcall(function() e.gui:Destroy() end) end
+    H.derived[m] = nil
+  end
+
+  local function cleanupStale()
+    for _, d in ipairs(WS:GetDescendants()) do
+      local n = d.Name
+      if n == "StaffHunt_HL" or n == "StaffESP_HL"
+        or n == "StaffHunt_Tag" or n == "StaffESP_Tag" then
+        pcall(function() d:Destroy() end)
+      end
+    end
+  end
+
+  local function makeGui()
+    local pg = LP and LP:FindFirstChild("PlayerGui")
+    if not pg then return end
+    local old = pg:FindFirstChild("StaffHuntGui")
+    if old then old:Destroy() end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "StaffHuntGui"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.DisplayOrder = 997
+    gui.Parent = pg
+
+    local fr = Instance.new("Frame")
+    fr.Size = UDim2.new(0, 470, 0, 40)
+    fr.Position = UDim2.new(0.5, -235, 0, 100)
+    fr.BackgroundColor3 = Color3.fromRGB(16, 18, 22)
+    fr.BackgroundTransparency = 0.25
+    fr.BorderSizePixel = 0
+    fr.Parent = gui
+
+    local cr = Instance.new("UICorner")
+    cr.CornerRadius = UDim.new(0, 8)
+    cr.Parent = fr
+
+    local lb = Instance.new("TextLabel")
+    lb.Size = UDim2.new(1, -16, 1, 0)
+    lb.Position = UDim2.new(0, 8, 0, 0)
+    lb.BackgroundTransparency = 1
+    lb.Font = Enum.Font.GothamMedium
+    lb.TextSize = 12
+    lb.TextColor3 = Color3.fromRGB(235, 238, 245)
+    lb.TextXAlignment = Enum.TextXAlignment.Left
+    lb.Text = "特殊研究员追猎：启动中"
+    lb.Parent = fr
+
+    H.label = lb
+  end
+
+  local function setStatus(t)
+    H.status = t
+    if H.label then H.label.Text = t end
+  end
+
+  local function groundY(p)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local ch = LP and LP.Character
+    params.FilterDescendantsInstances = ch and { ch } or {}
+    local hit = WS:Raycast(p + Vector3.new(0, 40, 0), Vector3.new(0, -140, 0), params)
+    if hit then return hit.Position.Y end
+    return p.Y
+  end
+
+  local function tpTo(m)
+    local ch = LP and LP.Character
+    local root = myRoot()
+    local head = headOf(m)
+    if not (ch and root and head) then return false, "缺少角色/目标坐标" end
+
+    local tPos = head.Position
+    local dir = root.Position - tPos
+    dir = Vector3.new(dir.X, 0, dir.Z)
+    if dir.Magnitude < 0.5 then dir = Vector3.new(0, 0, 1) end
+
+    local dest = tPos + dir.Unit * H.SafeDist
+    dest = Vector3.new(dest.X, groundY(dest) + 3, dest.Z)
+
+    local ok = pcall(function()
+      ch:PivotTo(CFrame.lookAt(dest, Vector3.new(tPos.X, dest.Y + 1, tPos.Z)))
+    end)
+    if not ok then return false, "PivotTo 失败（角色可能已消失）" end
+    return true
+  end
+
+  local function watch(m, secs)
+    if not H.AutoWatch then return end
+    local head = headOf(m)
+    local cam = WS.CurrentCamera
+    if not (head and cam) then return end
+    if H.watchConn then H.watchConn:Disconnect() H.watchConn = nil end
+
+    local stopAt = os.clock() + (secs or H.WatchSeconds)
+    H.watchConn = RUS.RenderStepped:Connect(function()
+      if not H.Enabled or os.clock() > stopAt or not head.Parent then
+        if H.watchConn then H.watchConn:Disconnect() H.watchConn = nil end
+        return
+      end
+      pcall(function()
+        cam.CFrame = CFrame.lookAt(cam.CFrame.Position, head.Position)
+      end)
+    end)
+  end
+
+  local function canTP(force)
+    if not force and not H.AutoTP then return false, "自动传送已关闭" end
+    if LP:GetAttribute("InRound") ~= true then return false, "不在回合中" end
+    if LP:GetAttribute("Role") == "SCP" then return false, "本局你是 SCP" end
+    if LP:GetAttribute("Ghost") == true then return false, "当前是鬼魂/旁观" end
+    if not force and not H.TPInEscape
+      and RS2:GetAttribute("RoundMode") == "Escape"
+      and RS2:GetAttribute("RoundPhase") == "Playing" then
+      return false, "任务模式：交给逃脱引擎"
+    end
+    local ch = LP.Character
+    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+    if not (ch and hum and hum.Health > 0) then return false, "角色未存活" end
+    return true
+  end
+
+  local function pickTarget()
+    local root = myRoot()
+    if not root then return nil end
+    local myPos = root.Position
+    local best, bestD = nil, math.huge
+    for m, e in pairs(H.derived) do
+      if e.tier == 2 and m.Parent then
+        local hum = m:FindFirstChildOfClass("Humanoid")
+        if (hum == nil) or hum.Health > 0 then
+          local head = headOf(m)
+          local p = head and head.Position or m:GetPivot().Position
+          local d = (p - myPos).Magnitude
+          if d < bestD then best, bestD = m, d end
+        end
+      end
+    end
+    return best, bestD
+  end
+
+  local function buildPool()
+    local pool, seen = {}, {}
+    local function push(m)
+      if m and not seen[m] then
+        seen[m] = true
+        pool[#pool + 1] = m
+      end
+    end
+
+    for _, m in ipairs(CS:GetTagged("StaffNPC")) do push(m) end
+
+    local folder = WS:FindFirstChild("Staff")
+    if folder then
+      for _, m in ipairs(folder:GetChildren()) do
+        if m:IsA("Model") then push(m) end
+      end
+    end
+
+    local isPlayerChar = {}
+    for _, p in ipairs(PlayersSvc:GetPlayers()) do
+      if p.Character then isPlayerChar[p.Character] = true end
+    end
+
+    for _, m in ipairs(WS:GetChildren()) do
+      if m:IsA("Model") and not isPlayerChar[m] and m:FindFirstChildOfClass("Humanoid") then
+        local role = m:GetAttribute("StaffRole")
+        local staff = m:GetAttribute("Staff") == true
+        local lname = string.lower(m.Name)
+        local hitKw = false
+        for _, kw in ipairs(KEYWORDS) do
+          if string.find(lname, kw, 1, true) then hitKw = true break end
+        end
+        if staff or role ~= nil or hitKw or H.playerNames[lname] then push(m) end
+      end
+    end
+
+    return pool
+  end
+
+  local function scan()
+    local pool = buildPool()
+    local alive = {}
+    local sp, ab, no = 0, 0, 0
+
+    for _, m in ipairs(pool) do
+      if m:IsA("Model") and m.Parent then
+        alive[m] = true
+        local hum = m:FindFirstChildOfClass("Humanoid")
+        local dead = (hum and hum.Health <= 0) or m:GetAttribute("Ragdolled") == true
+        local tier, reason = classify(m)
+
+        if tier == 2 then sp = sp + 1
+        elseif tier == 1 then ab = ab + 1
+        else no = no + 1 end
+
+        local e = H.derived[m]
+        if not e then
+          if not (tier == 0 and not H.ShowNormal) then
+            e = makeEntry(m, tier, reason)
+            H.derived[m] = e
+            if tier == 2 and not H.known[m] then
+              H.known[m] = true
+              local attrs = table.concat(attrsOf(m), ", ")
+              warn(string.format("[STAFFHUNT] ★ 特殊研究员：%s | %s | %s",
+                m:GetFullName(), reason, attrs))
+              pcall(function()
+                SG:SetCore("SendNotification", {
+                  Title = "★ 特殊研究员",
+                  Text = m.Name .. "  " .. reason,
+                  Duration = 6,
+                })
+              end)
+            end
+          end
+        elseif dead then
+          if e.hl then e.hl.FillTransparency = 0.95 end
+          if e.label then e.label.Text = "☠ " .. m.Name end
+        end
+      end
+    end
+
+    for m in pairs(H.derived) do
+      if not alive[m] then
+        if m == H.target then H.target = nil end
+        destroyEntry(m)
+      end
+    end
+
+    H.Counts = { special = sp, abnormal = ab, normal = no }
+    setStatus(string.format(
+      "特殊研究员追猎 %s  ★特殊 %d  ?可疑 %d  普通 %d  | %s",
+      (H.Enabled and "[ON]" or "[OFF]"), sp, ab, no, H.lastTP
+    ))
+  end
+
+  local function pursue()
+    if not H.AutoTP then return end
+    local ok = canTP(false)
+    if not ok then return end
+
+    local target, dist = pickTarget()
+    if not target then H.target = nil return end
+
+    if H.target ~= target then
+      H.target = target
+      H.tpCount = 0
+      H.nextTP = 0
+    end
+
+    local now = os.clock()
+    if dist <= H.FirstTPDist then return end
+    if now < H.nextTP then return end
+    if H.tpCount >= H.MaxTPPerTarget then return end
+
+    local done, err = tpTo(target)
+    H.tpCount = H.tpCount + 1
+    H.nextTP = now + H.TeleportCD
+
+    if done then
+      H.tpTotal = H.tpTotal + 1
+      H.lastTP = string.format("已传送 %s（%d→%d格·第%d次）",
+        target.Name, math.floor(dist), H.SafeDist, H.tpCount)
+      warn("[STAFFHUNT] " .. H.lastTP)
+      watch(target, H.WatchSeconds)
+      pcall(function()
+        SG:SetCore("SendNotification", {
+          Title = "→ 已传送到特殊研究员",
+          Text = target.Name .. "  第 " .. H.tpCount .. " 次",
+          Duration = 3,
+        })
+      end)
+    else
+      H.lastTP = "传送失败：" .. tostring(err)
+      warn("[STAFFHUNT] " .. H.lastTP)
+    end
+  end
+
+  local function refreshTexts()
+    local root = myRoot()
+    if not root then return end
+    local myPos = root.Position
+    for m, e in pairs(H.derived) do
+      if e.label and m.Parent then
+        local head = headOf(m)
+        local p = head and head.Position or m:GetPivot().Position
+        local d = (p - myPos).Magnitude
+        local tag = (e.tier == 2 and "★ SPECIAL")
+          or (e.tier == 1 and "? ABNORMAL") or m.Name
+        local extra = (e.tier ~= 0) and ("\n" .. e.reason) or ""
+        local txt = string.format("%s  [%d]", tag, math.floor(d)) .. extra
+        if e.lastTxt ~= txt then
+          e.lastTxt = txt
+          e.label.Text = txt
+        end
+      end
+    end
+  end
+
+  local function tpNow()
+    local ok, why = canTP(true)
+    if not ok then return false, why end
+    local target, dist = pickTarget()
+    if not target then return false, "场上没有 ★ 特殊研究员" end
+    local done, err = tpTo(target)
+    if done then
+      H.target = target
+      H.tpTotal = H.tpTotal + 1
+      H.lastTP = string.format("手动传送 %s（%d→%d格）",
+        target.Name, math.floor(dist or 0), H.SafeDist)
+      watch(target, H.WatchSeconds)
+      return true, H.lastTP
+    end
+    return false, err
+  end
+
+  local function dump()
+    local pool = buildPool()
+    local lines = { "=== STAFFHUNT v1.3 Dump ===" }
+    lines[#lines + 1] = string.format(
+      "Enabled=%s AutoTP=%s 目标=%s 累计传送=%d 作者资产=%d 玩家缓存=%d",
+      tostring(H.Enabled), tostring(H.AutoTP),
+      tostring(H.target and H.target.Name or "无"), H.tpTotal,
+      (function() local n = 0 for _ in pairs(H.ownerAssets) do n = n + 1 end return n end)(),
+      (function() local n = 0 for _ in pairs(H.playerAssets) do n = n + 1 end return n end)())
+    lines[#lines + 1] = "观察池=" .. #pool
+    for _, m in ipairs(pool) do
+      local hum = m:FindFirstChildOfClass("Humanoid")
+      local tier, reason = classify(m)
+      local _, ids = assetsOf(m)
+      lines[#lines + 1] = string.format("%s | %s | %s | tier=%d | 资产=[%s] | %s | attrs={%s}",
+        m:GetFullName(), m.Name, tostring(hum and hum.RigType), tier,
+        table.concat(ids, ","), reason, table.concat(attrsOf(m), ", "))
+    end
+    local text = table.concat(lines, "\n")
+    print(text)
+    return text
+  end
+
+  local function start()
+    if H.conn then return end
+    H.Enabled = true
+    cleanupStale()
+    makeGui()
+    refreshAssets()
+    H.conn = RUS.Heartbeat:Connect(function()
+      if not H.Enabled then return end
+      local now = os.clock()
+      local ok, err = pcall(function()
+        if now - H.assetAt > 30 then refreshAssets() end
+        if now - H.scanAt >= H.ScanInterval then
+          H.scanAt = now
+          scan()
+          pursue()
+        end
+        if now - (H.textAt or 0) >= 0.25 then
+          H.textAt = now
+          refreshTexts()
+        end
+      end)
+      if not ok then setStatus("追猎出错：" .. tostring(err)) end
+    end)
+    warn("[STAFFHUNT] 已开启 v1.3：描述资产匹配 + 自动传送（>" .. H.FirstTPDist
+      .. " 格传送至 " .. H.SafeDist .. " 格）")
+  end
+
+  local function stop()
+    H.Enabled = false
+    if H.conn then pcall(function() H.conn:Disconnect() end) end
+    H.conn = nil
+    if H.watchConn then pcall(function() H.watchConn:Disconnect() end) end
+    H.watchConn = nil
+    for m in pairs(H.derived) do destroyEntry(m) end
+    H.target = nil
+    local pg = LP and LP:FindFirstChild("PlayerGui")
+    local gui = pg and pg:FindFirstChild("StaffHuntGui")
+    if gui then gui:Destroy() end
+    H.label = nil
+  end
+
+  H.SetEnabled = function(v)
+    if v then start() else stop() end
+    return H.Enabled
+  end
+  H.Toggle = function() return H.SetEnabled(not H.Enabled) end
+  H.SetTP = function(v) H.AutoTP = v and true or false return H.AutoTP end
+  H.SetWatch = function(v) H.AutoWatch = v and true or false return H.AutoWatch end
+  H.SetShowNormal = function(v) H.ShowNormal = v and true or false return H.ShowNormal end
+  H.TPNow = tpNow
+  H.Dump = dump
+  H.HasTarget = function()
+    if not H.Enabled then return false end
+    local t, d = pickTarget()
+    return (t ~= nil) and (d or 999) > H.FirstTPDist
+  end
+  H.Off = function()
+    stop()
+    G.STAFFHUNT = nil
+  end
+
+  pcall(function()
+    local envs = { G }
+    if _G and _G ~= G then envs[#envs + 1] = _G end
+    for _, e in ipairs(envs) do
+      e.STAFFHUNT_TOGGLE = function() return H.Toggle() end
+      e.STAFFHUNT_TP     = function() return H.TPNow() end
+      e.STAFFHUNT_DUMP   = function() print(H.Dump()) end
+    end
+  end)
+
+  print("[STAFFHUNT] 已加载 v1.3 · 判据=描述资产(普通员工 0 项) + 作者/玩家资产匹配 · 自动传送 · 默认关闭 · STAFFHUNT_TOGGLE()")
+end
+
+-- ============================================================
+-- 饮水机 / 饮料机 透视（独立轻量模块 · 零 hook · 零元表）
+-- 判据：物件名 或 互动按钮(ProximityPrompt) 文案含 water/cooler/dispenser/
+--       drink/饮料/饮水 等词；名字含 294 的按「饮料机 SCP-294」标
+-- 诊断：getgenv().WATER_ESP.Dump()
 -- ============================================================
 do
-    if G.AUTOFARM and G.AUTOFARM.Off then pcall(function() G.AUTOFARM.Off() end) end
-    G.AUTOFARM = nil
+    local WS     = game:GetService("Workspace")
+    local RunSvc = game:GetService("RunService")
 
-    local LP  = PlayersSvc.LocalPlayer
-    local WS  = game:GetService("Workspace")
-    local RS  = game:GetService("ReplicatedStorage")
-    local RUS = game:GetService("RunService")
-
-    local F = {
-        Enabled   = false,
-        AutoVote  = true,   -- 自动投票（开逃脱时投 Escape，否则投 Survival）
-        AutoLoot  = true,   -- 自动捡物资箱（仅生存局）
-        AutoRoof  = true,   -- 捡完传天花板（仅生存局）
-        AutoClaim = true,   -- 自动领任务奖励
-        AutoEscape = true,  -- v16.12：任务模式(Escape)时接管做清单任务+坐电梯
-        ClaimEvery = 0.5,   -- 领奖检查间隔(秒)：只读 Snapshot，检测到可领立即领+级联
-        ClaimBurst = true,  -- 领到奖励后立刻连查，直到无可领
-        Claiming   = false, -- 防重入锁
-        AchClaims  = 0,     -- 成就奖励累计领取次数
-        _achSig    = nil,   -- 成就数据签名（变化即触发全扫）
-        _achSigT   = 0,     -- 上次成就全扫时间（4 秒兜底）
-        Phase     = "待命（默认关闭）",
-        Mode      = "无",   -- 本局模式：Escape / Survival / 无
-        Crates    = 0,      -- 本轮扫到的可开箱数
-        Looted    = 0,      -- 本轮已开箱数
-        Looting   = false,  -- 是否正在捡箱
-        Votes     = 0,      -- 累计投票次数
-        LastVote  = "无",
-        Claims    = 0,      -- 累计领奖次数
-        LastClaim = "无",
-        Conn      = nil,
-        ModeConn  = nil,
-        ClaimConn = nil,
+    local W = {
+        Enabled = true, Range = 1200, ScanInterval = 6,
+        Marks = {}, Count = 0, Found = 0, Status = "待命",
     }
-    G.AUTOFARM = F
+    G.WATER_ESP = W
 
-    local FPP = (getgenv and getgenv().fireproximityprompt) or _G.fireproximityprompt
-    local function lo(s) return string.lower(tostring(s or "")) end
+    local NAME_HITS = { "water", "cooler", "dispenser", "fountain", "vending",
+        "soda", "coffee", "beverage", "drink", "kettle", "thermos",
+        "purifier", "aqua", "hydration", "jug", "水", "饮" }
+    local PROMPT_HITS = { "water", "drink", "dispense", "beverage", "soda",
+        "coffee", "饮水", "水", "饮料", "喝", "接水", "取水" }
+    local BAD = { "door", "gate", "wall", "pipe", "wire", "cable", "effect",
+        "particle", "sound", "gui", "texture", "decal", "fall", "corpse",
+        "crate", "supply", "drag", "mask", "screen" }
 
-    -- 角色工具
-    local function getHRP()
-        local ch = LP and LP.Character
-        return ch and ch:FindFirstChild("HumanoidRootPart") or nil
-    end
-    local function getHum()
-        local ch = LP and LP.Character
-        return ch and ch:FindFirstChildOfClass("Humanoid") or nil
-    end
+    local HEAVY = Enum.Font.GothamBold
+    pcall(function() HEAVY = Enum.Font.GothamBlack end)
 
-    -- 瞬移（真机验证：PivotTo 不回弹）
-    local function tp(pos)
-        local ch = LP and LP.Character
-        if not ch then return false end
-        local ok = pcall(function()
-            if ch.PivotTo then
-                ch:PivotTo(CFrame.new(pos))
-            else
-                local hrp = ch:FindFirstChild("HumanoidRootPart")
-                if hrp then hrp.CFrame = CFrame.new(pos) end
-            end
-        end)
-        return ok
-    end
+    local function low(s) return string.lower(tostring(s or "")) end
 
-    -- 这是不是「真正能开」的物资箱 PP
-    local function isCratePP(x)
-        if not x then return false end
-        local ok, isCrate = pcall(function()
-            if not x:IsA("ProximityPrompt") then return false end
-            if not x.Enabled then return false end  -- 只检测未打开(Enabled=true)的箱子，已开箱不传送
-            local obj = lo(x.ObjectText)
-            local act = lo(x.ActionText)
-            if string.find(obj, "door", 1, true) then return false end
-            if string.find(act, "close", 1, true) then return false end
-            local opens = string.find(act, "open", 1, true)
-                or string.find(act, "search", 1, true)
-                or string.find(act, "loot", 1, true)
-            if not opens then return false end
-            -- string.find 返回「起始位置数字」而非布尔，必须 ~= nil 转布尔
-            local hasCrate  = string.find(obj, "crate", 1, true) ~= nil
-            local hasSupply = string.find(obj, "supply", 1, true) ~= nil
-            return hasCrate or hasSupply
-        end)
-        return ok and isCrate == true
-    end
-
-    -- PP 世界坐标
-    local function ppWorld(x)
-        local w
-        pcall(function()
-            local p = x.Parent
-            if p and p:IsA("Attachment") then w = p.WorldPosition
-            elseif p and p:IsA("BasePart") then w = p.Position
-            elseif p and p.Parent and p.Parent:IsA("BasePart") then w = p.Parent.Position end
-        end)
-        return w
-    end
-
-    -- 触发一个 PP（fire 优先，回退 InputHold）
-    local function firePrompt(pp)
-        pcall(function()
-            if FPP then FPP(pp, 1, true)
-            else
-                pp:InputHoldBegin()
-                task.delay(0.05, function() pcall(function() pp:InputHoldEnd() end) end)
-            end
-        end)
-    end
-
-    -- ============ ① 投票（生存 / 任务逃脱）============
-    -- v16.12：开放「任务模式自动逃脱」时投 Escape，否则维持原来的投 Survival。
-    -- 投票只由本模块发起（内嵌 AUTOESCAPE 的 AutoVote 已置 false），绝不会一局投两票。
-    local function voteOne(want)
-        local ok = false
-        pcall(function()
-            local remotes = RS:FindFirstChild("Remotes")
-            local rv = remotes and remotes:FindFirstChild("RoundVote")
-            if rv then
-                rv:FireServer(want)
-                F.Votes = F.Votes + 1
-                F.LastVote = want
-                ok = true
-            end
-        end)
-        return ok, want
-    end
-    local function voteRound()
-        return voteOne((F.AutoEscape and "Escape") or "Survival")
-    end
-    local function voteSurvival()   -- 兼容旧调用：本票强制投生存，不改开关
-        return voteOne("Survival")
-    end
-
-    -- ============ ①' 任务模式逃脱引擎调度 ============
-    -- 引擎 = 内嵌的 G.AUTOESCAPE（读 EscapeChecklist / EscapeTargets，按序触发
-    -- ProximityPrompt、上传时锚定藏在屏幕上方、全部完成后坐电梯）。
-    -- 这里只负责「什么时候开、什么时候关」，具体干活动作全在引擎里。
-    local function escapeEngine() return G.AUTOESCAPE end
-
-    local function setEscape(on)
-        local e = escapeEngine()
-        if not e then return false end
-        if on then
-            if not e.Enabled then e.SetEnabled(true) end
-        else
-            if e.Enabled then e.SetEnabled(false) end
+    local function hasAny(t, list)
+        t = low(t)
+        for i = 1, #list do
+            if string.find(t, low(list[i]), 1, true) then return true end
         end
-        return true
+        return false
+    end
+    local function badName(n) return hasAny(n, BAD) end
+    local function hitName(n) return hasAny(n, NAME_HITS) end
+
+    local function hitPrompt(p)
+        local t = ""
+        pcall(function()
+            t = tostring(p.ActionText) .. " " .. tostring(p.ObjectText)
+                .. " " .. tostring(p.Parent and p.Parent.Name)
+        end)
+        return hasAny(t, PROMPT_HITS)
     end
 
-    -- 是否「本局该做逃脱」：模式=逃脱 + 阶段=进行中 + 自己不是 SCP/鬼魂
-    local function shouldEscape()
-        if not F.AutoEscape then return false end
-        if RS:GetAttribute("RoundMode") ~= "Escape" then return false end
-        if RS:GetAttribute("RoundPhase") ~= "Playing" then return false end
-        if LP:GetAttribute("InRound") ~= true then return false end
-        if LP:GetAttribute("Role") == "SCP" then return false end
-        if LP:GetAttribute("Ghost") == true then return false end
-        return true
-    end
-
-    -- ============ ② 自动捡物资箱 ============
-    local function scanCrates()
-        local list = {}
-        for _, x in ipairs(WS:GetDescendants()) do
-            if isCratePP(x) then
-                local w = ppWorld(x)
-                if w then list[#list + 1] = { pp = x, w = w } end
+    local function anchorOf(o)
+        if not o then return nil end
+        local ok, isPart = pcall(function() return o:IsA("BasePart") end)
+        if ok and isPart then return o end
+        local okP, pp = pcall(function() return o.PrimaryPart end)
+        if okP and pp then return pp end
+        local okD, desc = pcall(function() return o:GetDescendants() end)
+        if okD and desc then
+            for i = 1, #desc do
+                local x = desc[i]
+                local okB, isB = pcall(function() return x:IsA("BasePart") end)
+                if okB and isB then return x end
             end
         end
-        F.Crates = #list
-        return list
+        return nil
     end
 
-    local function lootCrates()
-        local crates = scanCrates()
-        F.Looted = 0
-        if #crates == 0 then
-            F.Phase = "无箱可捡"
+    -- 命中 Part 时上跳到「名字也命中」的最近 Model，避免同一台机器被标十几次
+    local function nearestHitModel(o)
+        local cur = o
+        for _ = 1, 4 do
+            local ok, p = pcall(function() return cur.Parent end)
+            if not ok or not p or p == WS then break end
+            local okM, isM = pcall(function() return p:IsA("Model") end)
+            if okM and isM then
+                local nm
+                pcall(function() nm = p.Name end)
+                if nm and hitName(nm) and not badName(nm) then return p end
+            end
+            cur = p
+        end
+        return o
+    end
+
+    local function safeParent(inst)
+        local ok = pcall(function() inst.Parent = game:GetService("CoreGui") end)
+        if not ok or not inst.Parent then pcall(function() inst.Parent = WS end) end
+    end
+
+    local function setMark(o, part, base)
+        local r = W.Marks[o]
+        if r then
+            r.part = part
+            r.base = base
+            pcall(function() r.bg.Adornee = part end)
             return
         end
-        for i, c in ipairs(crates) do
-            if not F.Enabled or not F.Looting then return end
-            local pp = c.pp
-            if isCratePP(pp) then  -- 已开/失效跳过
-                F.Phase = string.format("捡箱 %d/%d", i, #crates)
-                -- TP 到箱前 3 studs（PP 激活距离 7，留余量）
-                tp(c.w + Vector3.new(0, 0, 3))
-                task.wait(0.5)
-                -- MoveTo 真实走近，触发 PP 系统认可位置（真机验证：瞬移不触发 PromptShown）
-                local hum = getHum()
-                if hum then pcall(function() hum:MoveTo(c.w) end) end
-                -- 等待走到 + 期间 fire（PromptShown 触发后即可开）
-                local fired = false
-                for j = 1, 20 do
-                    task.wait(0.2)
-                    local hrp = getHRP()
-                    local d = hrp and (hrp.Position - c.w).Magnitude or 999
-                    if d < 3.5 and not fired then
-                        firePrompt(pp)
-                        fired = true
-                    elseif fired and not pp.Enabled then
-                        break  -- 开箱成功
+        local bg = Instance.new("BillboardGui")
+        bg.Name = "WATER_BB"
+        bg.Adornee = part
+        bg.AlwaysOnTop = true
+        bg.MaxDistance = W.Range
+        bg.Size = UDim2.new(0, 200, 0, 34)
+        bg.StudsOffset = Vector3.new(0, 1.6, 0)
+        safeParent(bg)
+        local tl = Instance.new("TextLabel")
+        tl.Size = UDim2.new(1, 0, 1, 0)
+        tl.BackgroundTransparency = 1
+        tl.TextColor3 = Color3.fromRGB(110, 220, 255)
+        tl.TextStrokeColor3 = Color3.new(0, 0, 0)
+        tl.TextStrokeTransparency = 0
+        tl.TextSize = 15
+        tl.Font = HEAVY
+        tl.Text = base
+        tl.Parent = bg
+        W.Marks[o] = { bg = bg, tl = tl, part = part, base = base }
+    end
+
+    local function clearMark(o)
+        local r = W.Marks[o]
+        if not r then return end
+        pcall(function() r.bg:Destroy() end)
+        W.Marks[o] = nil
+    end
+
+    local function scan()
+        local found, foundN = {}, 0
+        local okD, desc = pcall(function() return WS:GetDescendants() end)
+        if okD and desc then
+            local n = #desc
+            if n > 12000 then n = 12000 end
+            for i = 1, n do
+                -- 分批让出一帧：单次 1.2 万后代不再压成一个大长帧（卡顿主因）
+                if i % 3000 == 0 then task.wait() end
+                local o = desc[i]
+                local okC, cls = pcall(function() return o.ClassName end)
+                if okC then
+                    if cls == "ProximityPrompt" then
+                        if hitPrompt(o) then
+                            local holder
+                            pcall(function()
+                                holder = o:FindFirstAncestorOfClass("Model") or o.Parent
+                            end)
+                            if holder then
+                                local nm
+                                pcall(function() nm = holder.Name end)
+                                if nm and not badName(nm) then
+                                    if not found[holder] then found[holder] = true; foundN = foundN + 1 end
+                                end
+                            end
+                        end
+                    elseif cls == "Model" or cls == "Part" or cls == "MeshPart"
+                        or cls == "UnionOperation" or cls == "TrussPart"
+                        or cls == "SpawnLocation" then
+                        local nm = o.Name
+                        if nm then
+                            local ln = string.lower(nm)
+                            -- 廉价预过滤：名字里没有任何候选词就直接跳过（省掉后续 pcall/递归）
+                            local quick = false
+                            for qi = 1, #NAME_HITS do
+                                if string.find(ln, NAME_HITS[qi], 1, true) then quick = true; break end
+                            end
+                            if quick and not badName(nm) then
+                                local t = nearestHitModel(o)
+                                if not found[t] then found[t] = true; foundN = foundN + 1 end
+                            end
+                        end
                     end
                 end
-                if not fired then firePrompt(pp) end
-                task.wait(0.4)
-                -- 兜底 InputHold
-                if pp.Enabled then
-                    pcall(function() pp:InputHoldBegin() end)
-                    task.wait(0.1)
-                    pcall(function() pp:InputHoldEnd() end)
-                    task.wait(0.3)
-                end
-                if not pp.Enabled then F.Looted = F.Looted + 1 end
-                task.wait(0.3)
             end
         end
-    end
 
-    -- ============ ③ 自动传天花板 ============
-    local function findRoof()
-        local best, bestTop = nil, -math.huge
-        for _, p in ipairs(WS:GetDescendants()) do
-            if p:IsA("BasePart") then
-                local nm = lo(p.Name)
-                if string.find(nm, "roof", 1, true) or string.find(nm, "ceiling", 1, true) then
-                    local top = p.Position.Y + p.Size.Y / 2
-                    if top > bestTop then bestTop = top; best = p end
+        local marked = 0
+        for _ in pairs(W.Marks) do marked = marked + 1 end
+
+        for o in pairs(found) do
+            local part = anchorOf(o)
+            if part then
+                if W.Marks[o] then
+                    W.Marks[o].part = part
+                    pcall(function() W.Marks[o].bg.Adornee = part end)
+                elseif marked < 60 then
+                    local nm
+                    pcall(function() nm = o.Name end)
+                    local base = string.find(low(nm), "294", 1, true)
+                        and "饮料机 SCP-294" or ("饮水机 · " .. tostring(nm))
+                    setMark(o, part, base)
+                    marked = marked + 1
                 end
             end
         end
-        return best, bestTop
-    end
 
-    local function gotoRoof()
-        local roof, top = findRoof()
-        if not roof then
-            F.Phase = "无天花板"
-            return false
+        for o, r in pairs(W.Marks) do
+            if not found[o] or r.stale then clearMark(o) end
         end
-        local target = roof.Position + Vector3.new(0, roof.Size.Y / 2 + 5, 0)
-        local ok = tp(target)
-        if ok then F.Phase = "已传天花板" end
-        return ok
+
+        W.Found  = foundN
+        W.Count  = marked
+        W.Status = "已标 " .. tostring(marked) .. " / 命中 " .. tostring(foundN)
     end
 
-    -- ============ ④ 自动领奖励 ============
-    -- 成就奖励（MISSIONS → ACHIEVEMENTS）：实测接口 ClaimAchievement(key)，服务器判定可领返回 true
-    local ACH_KEYS = {
-        "Streak","Played","Spec939","Research","Escapes","SCPKills","Alive",
-        "Emotes","Level","SCPRounds","Slides","Spec049","SCPWins","Doors",
-        "Crates","Quests","Lifer","Spec096","Survive",
-    }
-    local function achSignature(state)
-        if type(state) ~= "table" or type(state.Mission) ~= "table" then return "" end
-        local parts = {}
-        -- 覆盖全部字段，任何成就对应统计一变就立即触发
-        local ach = state.Mission.Ach or {}
-        for k, v in pairs(ach) do parts[#parts + 1] = "a" .. tostring(k) .. "=" .. tostring(v) end
-        local val = state.Mission.Values or {}
-        for k, v in pairs(val) do parts[#parts + 1] = "v" .. tostring(k) .. "=" .. tostring(v) end
-        table.sort(parts)
-        return table.concat(parts, "|")
-    end
-
-    local function claimRewards()
-        local ok, res = pcall(function()
-            local remotes = RS:FindFirstChild("Remotes")
-            local rr = remotes and remotes:FindFirstChild("RewardsRequest")
-            if not rr then return nil end
-            -- Snapshot 返回 (bool, string, state表, reward表)：真正的数据在第 3 个返回值
-            local a, b, state = rr:InvokeServer("Snapshot")
-            return { rr = rr, state = state }
-        end)
-        if not ok or not res then return 0, "无RewardsRequest" end
-        local rr, state = res.rr, res.state
-        if type(state) ~= "table" or state.Loaded ~= true then return 0, "未加载" end
-        local n = 0
-        local what = {}
-        -- ① 领每日（CanClaim=true 时可领）
-        if state.CanClaim == true then
-            pcall(function() rr:InvokeServer("ClaimDaily", nil) end)
-            n = n + 1; what[#what + 1] = "每日"
-        end
-        -- ② 领已完成任务（Quests 字段：Claimed/Progress/Target）
-        if type(state.Quests) == "table" then
-            for i, q in ipairs(state.Quests) do
-                if type(q) == "table" and q.Claimed ~= true and (q.Progress or 0) >= (q.Target or 0) then
-                    pcall(function() rr:InvokeServer("ClaimQuest", i) end)
-                    n = n + 1; what[#what + 1] = "任务" .. i
+    -- 距离刷新（0.25s 一次，只改文字，不重扫）
+    RunSvc.RenderStepped:Connect(function()
+        if not W.Enabled then return end
+        local now = tick()
+        if now - (W._t or 0) < 0.25 then return end
+        W._t = now
+        local cam = WS.CurrentCamera
+        if not cam then return end
+        local cp = cam.CFrame.Position
+        for _, r in pairs(W.Marks) do
+            local ok = pcall(function()
+                if not r.part or not r.part.Parent then
+                    r.stale = true
+                    return
                 end
-            end
-        end
-        -- ③ 时长奖励（已按用户要求关闭，不再领取）
-        -- ④ 成就奖励：签名变化立即全扫；4 秒兜底全扫，防止服务器 Snapshot 缓存延迟漏领
-        local sig = achSignature(state)
-        local nowt = tick()
-        local due = (nowt - (F._achSigT or 0)) >= 4
-        if sig ~= "" and (due or sig ~= F._achSig) then
-            for _, k in ipairs(ACH_KEYS) do
-                task.wait(0.03)
-                local okc, got = pcall(function() return rr:InvokeServer("ClaimAchievement", k) end)
-                if okc and got == true then
-                    n = n + 1
-                    F.AchClaims = F.AchClaims + 1
-                    what[#what + 1] = "成就:" .. k
-                end
-            end
-            F._achSig = sig
-            F._achSigT = nowt
-        end
-        if n > 0 then
-            F.Claims = F.Claims + n
-            F.LastClaim = table.concat(what, ",")
-        end
-        return n, table.concat(what, ",")
-    end
-
-    -- 级联领奖：检测到可领就连查直到清空
-    local function claimSmart()
-        if F.Claiming then return 0, "领奖中" end
-        F.Claiming = true
-        local total, allWhat, guard = 0, {}, 0
-        while guard < 12 do
-            guard = guard + 1
-            local n, what = claimRewards()
-            if n and n > 0 then
-                total = total + n
-                if what and what ~= "" then allWhat[#allWhat + 1] = what end
-                if F.ClaimBurst then task.wait(0.3) else break end
-            else
-                break
-            end
-        end
-        F.Claiming = false
-        if total > 0 then F.Phase = "领奖：+" .. tostring(total) .. " " .. table.concat(allWhat, ",") end
-        return total, table.concat(allWhat, ",")
-    end
-
-    -- 事件驱动：有奖励信号时立刻领（回合结算 / 奖励属性变化）
-    local claimDebounce = 0
-    local function fastClaim(reason)
-        if not F.Enabled or not F.AutoClaim then return end
-        local nowt = tick()
-        if nowt - claimDebounce < 0.5 then return end
-        claimDebounce = nowt
-        task.spawn(function()
-            task.wait(0.5)
-            if F.Enabled and F.AutoClaim then
-                local n = claimSmart()
-                if n > 0 then F.LastClaim = F.LastClaim .. " [" .. tostring(reason or "事件") .. "]" end
-            end
-        end)
-    end
-
-    -- ============ 主状态机（监听 RoundPhase / RoundMode）============
-    -- v16.12：本轮如果是 Escape（任务模式），不捡箱、不传天花板，直接把控制权
-    -- 交给内嵌逃脱引擎；生存局照旧。任何切回/退出都立即关闭引擎，不留残留。
-    local function onPhase()
-        if not F.Enabled then return end
-        local phase = RS:GetAttribute("RoundPhase")
-        local mode  = RS:GetAttribute("RoundMode")
-
-        if phase == "Voting" then
-            F.Mode = "投票"
-            if F.AutoVote and not F.VotedThisPhase then
-                F.VotedThisPhase = true
-                task.spawn(function()
-                    task.wait(0.6)
-                    local ok, want = voteRound()
-                    F.Phase = ok and ("已投 " .. tostring(want)) or "投票失败"
-                end)
-            elseif not F.AutoVote then
-                F.Phase = "投票中(不自动投票)"
-            end
-        elseif phase == "Playing" then
-            F.VotedThisPhase = false
-            F.Mode = tostring(mode or "?")
-            if mode == "Escape" then
-                -- ===== 任务模式：全自动逃脱 =====
-                F.Looting = false
-                if LP:GetAttribute("Role") == "SCP" then
-                    setEscape(false)
-                    F.Phase = "任务模式：本局你是 SCP"
-                elseif shouldEscape() then
-                    F.Phase = "任务模式：自动逃脱"
-                    if not setEscape(true) then
-                        F.Phase = "任务模式：缺少 AUTOESCAPE 引擎"
-                    end
+                local d = (r.part.Position - cp).Magnitude
+                if d > W.Range then
+                    r.bg.Enabled = false
                 else
-                    setEscape(false)
-                    F.Phase = "任务模式：未参与(旁观/已逃脱)"
-                end
-            else
-                -- ===== 生存模式：原挂机流程 =====
-                setEscape(false)
-                if F.AutoLoot and not F.Looting then
-                    F.Looting = true
-                    task.spawn(function()
-                        F.Phase = "开始捡箱"
-                        lootCrates()
-                        if F.Enabled and F.AutoRoof then
-                            gotoRoof()
-                        end
-                        F.Looting = false
-                        if F.Enabled and F.Phase ~= "已传天花板" then
-                            F.Phase = "挂机中"
-                        end
-                    end)
-                end
-            end
-        elseif phase == "Intermission" or phase == "Lobby" then
-            F.Looting = false
-            F.VotedThisPhase = false
-            F.Crates, F.Looted = 0, 0
-            F.Mode = "无"
-            setEscape(false)   -- 回合结束立刻收手，下一局不残留
-            F.Phase = (phase == "Lobby") and "大厅" or "局间休息"
-        end
-    end
-
-    local function start()
-        if F.Conn then return end
-        F.Conn = RS:GetAttributeChangedSignal("RoundPhase"):Connect(onPhase)
-        -- v16.12：中途切模式（例如管理员直接开/关逃脱）也立刻交接，不等下一局
-        F.ModeConn = RS:GetAttributeChangedSignal("RoundMode"):Connect(onPhase)
-        pcall(onPhase)
-        -- 领奖定时器：只读轮询，检测到可领立即领+级联
-        if F.AutoClaim then
-            F.ClaimConn = task.spawn(function()
-                while G.AUTOFARM == F do
-                    task.wait(F.ClaimEvery)
-                    if F.Enabled and F.AutoClaim and not F.Claiming then
-                        pcall(claimSmart)
-                    end
+                    r.bg.Enabled = true
+                    r.tl.Text = string.format("%s  %dm", r.base, math.floor(d))
                 end
             end)
-            -- 事件驱动：回合结算 / 奖励属性变化立即领
-            pcall(function()
-                F.RewardPhaseConn = RS:GetAttributeChangedSignal("RoundPhase"):Connect(function()
-                    task.spawn(function() task.wait(1.0); fastClaim("回合结算") end)
-                end)
-                F.RewardAttrConn = LP:GetAttributeChangedSignal("RewardReady"):Connect(function() fastClaim("奖励属性") end)
-            end)
-            task.spawn(function() task.wait(0.5); fastClaim("启动") end)
-        end
-    end
-    local function stop()
-        setEscape(false)   -- 关闭总开关时同步关掉逃脱引擎，避免它继续传送
-        if F.Conn then pcall(function() F.Conn:Disconnect() end) end
-        if F.ModeConn then pcall(function() F.ModeConn:Disconnect() end) end
-        if F.RewardPhaseConn then pcall(function() F.RewardPhaseConn:Disconnect() end) end
-        if F.RewardAttrConn then pcall(function() F.RewardAttrConn:Disconnect() end) end
-        F.Conn = nil
-        F.ModeConn = nil
-        F.RewardPhaseConn = nil
-        F.RewardAttrConn = nil
-        F.Looting = false
-    end
-
-    -- ============ 对外接口 ============
-    F.SetEnabled = function(v)
-        F.Enabled = v and true or false
-        if F.Enabled then
-            start()
-            F.Phase = "运行中"
-            warn("[AUTOFARM] 已开启：投票(生存/逃脱) + 生存局捡箱躲藏 + 任务模式自动逃脱 + 领奖励")
-        else
-            stop()
-            F.Phase = "待命（已关闭）"
-            warn("[AUTOFARM] 已关闭")
-        end
-        return F.Enabled
-    end
-    F.SetAutoVote  = function(v) F.AutoVote = v and true or false; return F.AutoVote end
-    F.SetAutoLoot  = function(v) F.AutoLoot = v and true or false; return F.AutoLoot end
-    F.SetAutoRoof  = function(v) F.AutoRoof = v and true or false; return F.AutoRoof end
-    F.SetAutoClaim = function(v)
-        F.AutoClaim = v and true or false
-        if F.AutoClaim and F.Enabled and not F.ClaimConn then start() end
-        if F.AutoClaim then fastClaim("开启自动领奖") end
-        return F.AutoClaim
-    end
-    -- v16.12：任务模式逃脱开关；关掉时若正在逃脱，立刻停手不再传送
-    F.SetAutoEscape = function(v)
-        F.AutoEscape = v and true or false
-        if not F.AutoEscape then setEscape(false) end
-        return F.AutoEscape
-    end
-    -- 手动立即开始/停止逃脱（不等回合判断）
-    F.EscapeNow = function()
-        if not escapeEngine() then return false, "缺少 AUTOESCAPE 引擎" end
-        if not setEscape(true) then return false, "引擎启动失败" end
-        F.Phase = "任务模式：手动逃脱"
-        return true
-    end
-    F.StopEscape = function() setEscape(false); return true end
-    F.ClaimNow = function()
-        local n, what = claimSmart()
-        F.Phase = "领奖：" .. (n > 0 and ("+" .. n .. " " .. what) or "无可领")
-        return n, what
-    end
-    F.LootNow = function()
-        if F.Looting then return 0, "正在捡" end
-        F.Looting = true
-        task.spawn(function()
-            lootCrates()
-            F.Looting = false
-        end)
-        return F.Crates
-    end
-    F.GotoRoofNow = function() return gotoRoof() end
-    F.VoteNow = function() return voteRound() end
-    F.Dump = function()
-        local e = escapeEngine()
-        local esc = "无"
-        if e then
-            esc = string.format("Enabled=%s Phase=%s Current=%s 累计逃脱=%s",
-                tostring(e.Enabled), tostring(e.Phase), tostring(e.Current), tostring(e.Escapes))
-        end
-        return table.concat({
-            "=== AUTOFARM v1.2 Dump ===",
-            "Enabled=" .. tostring(F.Enabled) .. " Phase=" .. tostring(F.Phase)
-                .. " Mode=" .. tostring(F.Mode),
-            "AutoVote=" .. tostring(F.AutoVote) .. " AutoLoot=" .. tostring(F.AutoLoot)
-                .. " AutoRoof=" .. tostring(F.AutoRoof) .. " AutoClaim=" .. tostring(F.AutoClaim)
-                .. " AutoEscape=" .. tostring(F.AutoEscape),
-            "本轮扫箱=" .. tostring(F.Crates) .. " 已开=" .. tostring(F.Looted),
-            "累计投票=" .. tostring(F.Votes) .. "(最近 " .. tostring(F.LastVote) .. ")"
-                .. " 累计领奖=" .. tostring(F.Claims) .. " 成就领=" .. tostring(F.AchClaims)
-                .. " 最近=" .. tostring(F.LastClaim),
-            "RoundMode=" .. tostring(RS:GetAttribute("RoundMode"))
-                .. " RoundPhase=" .. tostring(RS:GetAttribute("RoundPhase")),
-            "任务逃脱引擎: " .. esc,
-        }, "\n")
-    end
-    F.Off = function()
-        F.Enabled = false
-        stop()
-        if F.ClaimConn then pcall(function() task.cancel(F.ClaimConn) end) end
-        F.ClaimConn = nil
-        G.AUTOFARM = nil
-    end
-
-    pcall(function()
-        local envs = { G }
-        if _G and _G ~= G then envs[#envs + 1] = _G end
-        for _, e in ipairs(envs) do
-            e.AUTOFARM_DUMP  = function() print(F.Dump()) end
-            e.AUTOFARM_CLAIM = function() return F.ClaimNow() end
-            e.AUTOFARM_LOOT  = function() return F.LootNow() end
-            e.AUTOFARM_ROOF  = function() return F.GotoRoofNow() end
-            e.AUTOFARM_VOTE  = function() return F.VoteNow() end
-            e.AUTOFARM_ESCAPE = function() return F.EscapeNow() end
+            if not ok then r.stale = true end
         end
     end)
 
-    print("[AUTOFARM] 已加载 v1.2 · 全自动挂机(投票/生存捡箱躲藏/任务模式自动逃脱/领奖励) · 默认关闭 · AUTOFARM_DUMP()")
+    task.spawn(function()
+        while G.WATER_ESP == W do
+            if W.Enabled then pcall(scan) end
+            task.wait(W.ScanInterval)
+        end
+    end)
+
+    W.SetEnabled = function(v)
+        W.Enabled = v and true or false
+        if not W.Enabled then
+            for o in pairs(W.Marks) do clearMark(o) end
+            W.Marks = {}
+            W.Status = "已关闭"
+        else
+            task.defer(function() pcall(scan) end)
+        end
+        return W.Enabled
+    end
+    W.SetRange = function(n) W.Range = math.max(50, tonumber(n) or 1200); return W.Range end
+    W.Dump = function()
+        local o = {}
+        o[#o + 1] = string.format("WATER_ESP Enabled=%s Range=%s Marks=%d Found=%d Status=%s",
+            tostring(W.Enabled), tostring(W.Range), W.Count, W.Found, tostring(W.Status))
+        for inst, r in pairs(W.Marks) do
+            local nm = "?"
+            pcall(function() nm = inst.Name end)
+            local pos = r.part and r.part.Position
+            o[#o + 1] = string.format("  %-28s %s", nm,
+                pos and string.format("(%.0f,%.0f,%.0f)", pos.X, pos.Y, pos.Z) or "无坐标")
+        end
+        return table.concat(o, "\n")
+    end
+
+    print("[WATER] 饮水机透视已装载 · 默认开 · 诊断 G.WATER_ESP.Dump()")
+end
+
+-- ============================================================
+-- 【内嵌】新 SCP 透视 NEWSCP_ESP v3（CollectionService 标签事件驱动 + 名字兜底）
+-- 覆盖：任何带 SCP 标签、或名字含 SCP 编号的「非角色」物件
+--       294 饮料机 / 458 披萨盒 / 500 药片 / 714 玉戒 / 1025 医学百科 …
+-- 角色型 SCP 不在这里标（跳过带 Humanoid 的对象，交给主 ESP，避免一个目标两套标签）
+-- 安全：只在 CoreGui 建 BillboardGui；不碰 PlayerGui / 触摸层 / 相机；不挂 hook
+-- 诊断：getgenv().NEWSCP_ESP.Dump()
+-- ============================================================
+do
+    local Gg = getgenv()
+    if Gg.NEWSCP_ESP and Gg.NEWSCP_ESP.Off then pcall(Gg.NEWSCP_ESP.Off) end
+
+    local WS = workspace
+    local CS = game:GetService("CollectionService")
+    local RS = game:GetService("RunService")
+
+    local ESP = {
+        Enabled      = true,
+        MaxDist      = 500,     -- 只显示这个距离内（米）
+        Marked       = {},
+        Conns        = {},
+        TagList      = {},
+        NameFallback = true,    -- 无标签时按物件名兜底（每 10s 一次，限 15000 个后代）
+        ScanInterval = 10,
+        Found        = 0,
+        Status       = "待命",
+    }
+    Gg.NEWSCP_ESP = ESP
+
+    local HEAVY = Enum.Font.GothamBold
+    pcall(function() HEAVY = Enum.Font.GothamBlack end)
+    local OUTLINE = Color3.new(0, 0, 0)
+
+    -- 附属子部件 / 装饰后缀：不单独透视（Cup 让 294 杯子不刷屏）
+    local SKIP_SUFFIX = { "Cup", "FeedScreen", "Passable", "Sinkhole", "Feed", "Screen",
+                          "Dragon", "Follower", "Cable", "Conduit", "Wire" }
+    local DEAD_KW     = { "corpse", "ragdoll", "dead", "remains", "oldbody", "debris" }
+
+    local function compact(s)
+        return string.gsub(string.lower(tostring(s or "")), "[-_%s]", "")
+    end
+
+    -- 从标签名解析 SCP 编号（1~4 位，保留前导零），排除附属/装饰/尸体
+    local function labelFromTag(tag)
+        local c = compact(tag)
+        for _, sf in ipairs(SKIP_SUFFIX) do
+            local cs = compact(sf)
+            if cs ~= "" and (string.find(c, cs, 1, true) or string.find(cs, c, 1, true)) then
+                return nil
+            end
+        end
+        for _, w in ipairs(DEAD_KW) do
+            if string.find(c, w, 1, true) then return nil end
+        end
+        local n = string.match(c, "scp(%d+)")
+        if not n or #n > 4 then return nil end
+        return "SCP-" .. n
+    end
+
+    -- 从物件名兜底解析（只认 scp+数字，避免 Room173 这类误标）
+    local function labelFromName(o)
+        local nm
+        pcall(function() nm = o.Name end)
+        if not nm then return nil end
+        local c = compact(nm)
+        for _, w in ipairs(DEAD_KW) do
+            if string.find(c, w, 1, true) then return nil end
+        end
+        for _, sf in ipairs(SKIP_SUFFIX) do
+            local cs = compact(sf)
+            if #cs > 3 and string.find(c, cs, 1, true) then return nil end
+        end
+        local n = string.match(c, "scp(%d%d%d%d?)")
+        if n then return "SCP-" .. n end
+        -- 没有编号时按「长词」认物（只用 >=6 字符的组合词，避免 ring/spring 这类误标）
+        local MAP = {
+            { "pizzabox",     "SCP-458" },
+            { "infinitepizza","SCP-458" },
+            { "coffeemachine", "SCP-294" },
+            { "vendingmachine","SCP-294" },
+            { "sodamachine",  "SCP-294" },
+            { "candybowl",    "SCP-330" },
+            { "panacea",      "SCP-500" },
+            { "medicalbook",  "SCP-1025" },
+            { "jadering",     "SCP-714" },
+        }
+        for _, kv in ipairs(MAP) do
+            if string.find(c, kv[1], 1, true) then return kv[2] end
+        end
+        return nil
+    end
+
+    local DANGER = {
+        ["049"]=true, ["096"]=true, ["106"]=true, ["173"]=true, ["303"]=true,
+        ["610"]=true, ["650"]=true, ["682"]=true, ["939"]=true, ["035"]=true,
+        ["1762"]=true, ["6161"]=true, ["079"]=true,
+    }
+    local function colorFor(label)
+        local id = string.match(label, "SCP%-(%d+)") or "0"
+        if DANGER[id] then return Color3.fromRGB(255, 40, 40) end
+        local n = tonumber(id) or 0
+        local palette = {
+            Color3.fromRGB(255, 90, 90),  Color3.fromRGB(255, 180, 70),
+            Color3.fromRGB(120, 210, 255), Color3.fromRGB(190, 130, 255),
+            Color3.fromRGB(130, 255, 170), Color3.fromRGB(255, 140, 210),
+        }
+        return palette[(n % #palette) + 1]
+    end
+
+    local function safeParent(inst)
+        local ok = pcall(function() inst.Parent = game:GetService("CoreGui") end)
+        if not ok or not inst.Parent then pcall(function() inst.Parent = WS end) end
+    end
+
+    local function addMark(o, label, src)
+        if ESP.Marked[o] then return end
+        local bg = Instance.new("BillboardGui")
+        bg.Name = "NS_BB"
+        bg.Adornee = o
+        bg.AlwaysOnTop = true
+        bg.MaxDistance = 5000
+        bg.Size = UDim2.new(0, 200, 0, 40)
+        bg.StudsOffset = Vector3.new(0, 1.2, 0)
+        safeParent(bg)
+        local tl = Instance.new("TextLabel")
+        tl.Size = UDim2.new(1, 0, 1, 0)
+        tl.BackgroundTransparency = 1
+        tl.TextColor3 = colorFor(label)
+        tl.TextStrokeColor3 = OUTLINE
+        tl.TextStrokeTransparency = 0
+        tl.TextXAlignment = Enum.TextXAlignment.Center
+        tl.TextYAlignment = Enum.TextYAlignment.Center
+        tl.TextSize = 16
+        tl.Font = HEAVY
+        tl.Text = label
+        tl.Parent = bg
+        ESP.Marked[o] = { bg = bg, tl = tl, label = label, applied = label, src = src or "tag" }
+    end
+
+    local function delMark(o)
+        local r = ESP.Marked[o]
+        if not r then return end
+        pcall(function() r.bg:Destroy() end)
+        ESP.Marked[o] = nil
+    end
+
+    local function isLiving(o)
+        local ok, h = pcall(function() return o:FindFirstChildOfClass("Humanoid") end)
+        return ok and h ~= nil
+    end
+
+    -- 标签来源：取该对象所有 SCP 标签里第一个有效编号
+    local function trackObject(o)
+        if not ESP.Enabled then return end
+        if ESP.Marked[o] then return end
+        local okT, isT = pcall(function() return o:IsA("Model") or o:IsA("BasePart") end)
+        if not okT or not isT then return end
+        if isLiving(o) then return end   -- 角色型交给主 ESP
+        local tags = {}
+        pcall(function() tags = CS:GetTags(o) end)
+        for _, t in ipairs(tags) do
+            local label = labelFromTag(t)
+            if label then addMark(o, label); return end
+        end
+        local okV, v = pcall(function() return o:GetAttribute("SCP") end)
+        if okV and v ~= nil then
+            addMark(o, "SCP-" .. tostring(v))
+        end
+    end
+
+    -- 收集所有含 SCP 的标签
+    pcall(function()
+        for _, t in ipairs(CS:GetAllTags()) do
+            if string.find(string.upper(tostring(t)), "SCP", 1, true) then
+                ESP.TagList[#ESP.TagList + 1] = t
+            end
+        end
+    end)
+
+    for _, t in ipairs(ESP.TagList) do
+        for _, o in ipairs(CS:GetTagged(t)) do
+            pcall(trackObject, o)
+        end
+    end
+
+    for _, t in ipairs(ESP.TagList) do
+        pcall(function()
+            table.insert(ESP.Conns, CS:GetInstanceAddedSignal(t):Connect(function(o)
+                pcall(trackObject, o)
+            end))
+            table.insert(ESP.Conns, CS:GetInstanceRemovedSignal(t):Connect(function(o)
+                pcall(delMark, o)
+            end))
+        end)
+    end
+
+    -- 名字兜底：无标签、但名字里就写着 SCP-xxx 的物件（294 机器 / 458 披萨盒等）
+    local function scanNames()
+        local ok, desc = pcall(function() return WS:GetDescendants() end)
+        if not ok or not desc then return 0 end
+        local n = #desc
+        if n > 15000 then n = 15000 end
+        local hit = 0
+        for i = 1, n do
+            if i % 3000 == 0 then task.wait() end   -- 分批让帧，避免单帧长卡
+            local o = desc[i]
+            local okC, cls = pcall(function() return o.ClassName end)
+            if okC then
+                if cls == "Model" or cls == "Part" or cls == "MeshPart"
+                    or cls == "UnionOperation" or cls == "Tool" then
+                    if not ESP.Marked[o] then
+                        local nm = o.Name
+                        local ln = string.lower(nm or "")
+                        if string.find(ln, "scp", 1, true)
+                            or string.find(ln, "pizza", 1, true)
+                            or string.find(ln, "machine", 1, true)
+                            or string.find(ln, "candy", 1, true)
+                            or string.find(ln, "panacea", 1, true) then
+                            if not isLiving(o) then
+                                local lb = labelFromName(o)
+                                if lb then
+                                    addMark(o, lb, "name")
+                                    hit = hit + 1
+                                end
+                            end
+                        end
+                    end
+                elseif cls == "ProximityPrompt" then
+                    -- 按钮文案兜底：「Use SCP-458 Pizza Box」这类
+                    local txt = ""
+                    pcall(function()
+                        txt = tostring(o.ActionText) .. " " .. tostring(o.ObjectText)
+                    end)
+                    local num = string.match(compact(txt), "scp(%d%d%d%d?)")
+                    if num then
+                        local holder
+                        pcall(function()
+                            holder = o:FindFirstAncestorOfClass("Model") or o.Parent
+                        end)
+                        if holder and not ESP.Marked[holder] and not isLiving(holder) then
+                            addMark(holder, "SCP-" .. num, "name")
+                            hit = hit + 1
+                        end
+                    end
+                end
+            end
+        end
+        for o in pairs(ESP.Marked) do
+            if not o.Parent then delMark(o) end
+        end
+        ESP.Found = hit
+        ESP.Status = "标签 " .. tostring(#ESP.TagList) .. " · 名字命中 " .. tostring(hit)
+        return hit
+    end
+
+    -- 距离刷新：每 2 秒只遍历已标记的对象
+    local distT = 0
+    table.insert(ESP.Conns, RS.Heartbeat:Connect(function(dt)
+        distT = distT + dt
+        if distT < 2 then return end
+        distT = 0
+        if not ESP.Enabled then return end
+        local cam = WS.CurrentCamera
+        if not cam then return end
+        local cp = cam.CFrame.Position
+        for o, r in pairs(ESP.Marked) do
+            if not o.Parent then
+                delMark(o)
+            else
+                local pos
+                pcall(function()
+                    if o:IsA("BasePart") then pos = o.Position else pos = o:GetPivot().Position end
+                end)
+                if pos then
+                    local d = (cp - pos).Magnitude
+                    if d > ESP.MaxDist then
+                        r.bg.Enabled = false
+                    else
+                        r.bg.Enabled = true
+                        local txt = r.label .. " " .. math.floor(d) .. "m"
+                        if r.applied ~= txt then r.applied = txt; r.tl.Text = txt end
+                    end
+                end
+            end
+        end
+    end))
+
+    task.spawn(function()
+        while Gg.NEWSCP_ESP == ESP do
+            if ESP.Enabled and ESP.NameFallback then pcall(scanNames) end
+            task.wait(ESP.ScanInterval)
+        end
+    end)
+
+    ESP.On = function()
+        ESP.Enabled = true
+        for _, t in ipairs(ESP.TagList) do
+            for _, o in ipairs(CS:GetTagged(t)) do pcall(trackObject, o) end
+        end
+        task.defer(function() pcall(scanNames) end)
+        return true
+    end
+    ESP.Off = function()
+        ESP.Enabled = false
+        for o in pairs(ESP.Marked) do delMark(o) end
+        ESP.Status = "已关闭"
+        return false
+    end
+    ESP.SetRange = function(m)
+        if type(m) == "number" and m > 0 then ESP.MaxDist = m end
+        return ESP.MaxDist
+    end
+    ESP.SetNameFallback = function(v)
+        ESP.NameFallback = v and true or false
+        if not ESP.NameFallback then
+            for o, r in pairs(ESP.Marked) do
+                if r.src == "name" then delMark(o) end
+            end
+        else
+            task.defer(function() pcall(scanNames) end)
+        end
+        return ESP.NameFallback
+    end
+    ESP.Dump = function()
+        local t = {}
+        for _, r in pairs(ESP.Marked) do t[#t + 1] = r.applied end
+        table.sort(t)
+        return "NEWSCP Enabled=" .. tostring(ESP.Enabled) .. " Range=" .. tostring(ESP.MaxDist)
+            .. " Tracked=" .. tostring(#t) .. " Tags=" .. tostring(#ESP.TagList)
+            .. " Fallback=" .. tostring(ESP.NameFallback) .. " -> " .. table.concat(t, ", ")
+    end
+
+    print("[ESP] 新SCP透视 NEWSCP_ESP v3 已内嵌装载 · " .. ESP.Dump())
 end
 
 -- 黑曜石 UI（开源原本：https://github.com/NightForRoblox/Obsidian）
@@ -6654,14 +9270,44 @@ local function buildObsidianUI(Library)
     addToggle("Player", "玩家透视")
     addToggle("Gun", "武器透视")
     addToggle("Crate", "物资箱透视")
+    GB:AddToggle("espWater", {
+        Text = "饮水机透视", Default = true,
+        Tooltip = "水机/饮水机/饮料机：名字或互动按钮含 water/drink/饮料/饮水 的物件；SCP-294 标为「饮料机」",
+        Callback = function(v)
+            if G.WATER_ESP then G.WATER_ESP.SetEnabled(v) end
+            Library:Notify("饮水机透视 " .. (v and "已开启" or "已关闭"), 2)
+        end,
+    })
+    GB:AddToggle("espNewScp", {
+        Text = "新SCP透视（全编号）", Default = true,
+        Tooltip = "标签或物件名含 SCP 编号的非角色物件：294 饮料机 / 458 披萨盒 / 500 药 / 714 玉戒 / 1025 医学百科…（角色型仍由上面的 SCP透视 负责）",
+        Callback = function(v)
+            if G.NEWSCP_ESP then
+                if v then pcall(G.NEWSCP_ESP.On) else pcall(G.NEWSCP_ESP.Off) end
+            end
+            Library:Notify("新SCP透视 " .. (v and "已开启" or "已关闭"), 2)
+        end,
+    })
 
     -- 子项：透视同样受「SCP透视」总开关约束
+    -- 徽章NPC：统一交给 STAFFHUNT v1.3（昨天的版本，判据更准 + 自带自动传送）
     GB:AddToggle("espStaff", {
         Text = "徽章NPC透视", Default = true,
-        Tooltip = "跟随 SCP透视 总开关；这里只关这一层",
+        Tooltip = "STAFFHUNT v1.3：描述资产判据 · ★特殊/可发徽章",
         Callback = function(v)
-            if G.STAFF_ESP then G.STAFF_ESP.SetUserEnabled(v) end
+            if G.STAFFHUNT and G.STAFFHUNT.SetEnabled then pcall(function() G.STAFFHUNT.SetEnabled(v) end) end
+            -- 旧的内嵌 STAFF_ESP 关闭，避免同一 NPC 画两套标签
+            if G.STAFF_ESP then pcall(function() G.STAFF_ESP.SetUserEnabled(false) end) end
             Library:Notify("徽章NPC透视 " .. (v and "已开启" or "已关闭"), 2)
+        end,
+    })
+    GB:AddToggle("espStaffTP", {
+        Text = "徽章NPC自动传送", Default = true,
+        Tooltip = "★特殊出现时自动传过去（任务模式 Escape 自动不传）",
+        Callback = function(v)
+            if G.STAFFHUNT and G.STAFFHUNT.SetTP then pcall(function() G.STAFFHUNT.SetTP(v) end) end
+            if G.STAFF_ESP then pcall(function() G.STAFF_ESP.SetTP(v) end) end
+            Library:Notify("徽章NPC自动传送 " .. (v and "已开启" or "已关闭"), 2)
         end,
     })
     GB:AddToggle("esp610anti", {
@@ -6709,7 +9355,7 @@ local function buildObsidianUI(Library)
         .. " · 跑步 " .. tostring(G.SPEED and G.SPEED.RunMin or 28))
     GBSPD:AddToggle("speedEn", {
         Text = "启用速度调节", Default = false,
-        Tooltip = "每帧压制 RunSystem 写入；关闭则还原原速",
+        Tooltip = "每帧压制 RunSystem 写入；关闭则还原原速。自己变成 SCP 时自动跳过、不覆盖原生移速",
         Callback = function(v)
             if G.SPEED then G.SPEED.SetEnabled(v) end
             Library:Notify("速度调节 " .. (v and "已开启" or "已关闭"), 2)
@@ -7096,103 +9742,72 @@ local function buildObsidianUI(Library)
     end)
 
     -- ===== 第三个栏位：攻击（GunAction 自动射击 v15）=====
-    local TabAtk = Window:AddTab("攻击", "crosshair")
-    local GA = TabAtk:AddLeftGroupbox("GunAction 自动射击", "crosshair")
-    GA:AddToggle("gunOn", {
-        Text = "启用自动射击（默认关）", Default = false,
-        Tooltip = "协议 Remotes.GunAction:FireServer(\"Shoot\", 命中位置, 命中Part)；手机可用浮动大按钮开关",
+    local TabAtk = Window:AddTab("rage", "crosshair")
+
+    -- 左：总开关 / 命中反馈 / 弹道显示
+    local RA = TabAtk:AddLeftGroupbox("rage", "crosshair")
+    RA:AddToggle("rageOn", {
+        Text = "总开关", Default = false,
+        Tooltip = "自动锁定 + 自动发包 Remotes.GunAction:FireServer(\"Shoot\", 命中点, Part)",
         Callback = function(v)
             if G.GUNBOT then G.GUNBOT.SetEnabled(v) end
-            Library:Notify("自动射击 " .. (v and "已开启" or "已关闭"), 2)
+            Library:Notify("rage " .. (v and "已开启" or "已关闭"), 2)
         end,
     })
-    GA:AddLabel("目标可设定：玩家 / SCP / 全部，并可锁定具体目标")
-    local gaModeLbl = GA:AddLabel("目标模式：仅玩家")
-    GA:AddButton({ Text = "⟳ 切换目标模式（玩家 → SCP → 全部）", Func = function()
-        if G.GUNBOT then
-            local m = G.GUNBOT.CycleMode()
-            setLbl(gaModeLbl, "目标模式：" .. (m == "玩家" and "仅玩家"
-                or (m == "SCP" and "仅 SCP" or "玩家 + SCP")))
-            Library:Notify("目标模式 → " .. m, 2)
-        end
-    end })
-    local gaLockLbl = GA:AddLabel("锁定目标：自动(最近)")
-    GA:AddButton({ Text = "◎ 循环锁定具体目标（玩家名 / SCP 编号）", Func = function()
-        if G.GUNBOT then
-            setLbl(gaLockLbl, "锁定目标：" .. tostring(G.GUNBOT.CycleTarget()))
-        end
-    end })
-    GA:AddButton({ Text = "✕ 清除锁定（回到自动最近）", Func = function()
-        if G.GUNBOT then G.GUNBOT.SetLock("") end
-        setLbl(gaLockLbl, "锁定目标：自动(最近)")
-        Library:Notify("已清除锁定", 2)
-    end })
-    GA:AddInput("gunPlayerFilter", {
-        Text = "指定玩家名（空=全部玩家）", Default = "",
-        Callback = function(v) if G.GUNBOT then G.GUNBOT.SetPlayerFilter(v) end end,
+    RA:AddToggle("rageHit", {
+        Text = "命中反馈", Default = false,
+        Tooltip = "命中标记 + 屏幕边缘闪光 + FOV 冲击 + 命中音效 + 目标高亮",
+        Callback = function(v)
+            if G.RAGE_FX then G.RAGE_FX.SetHit(v) end
+        end,
     })
-    GA:AddInput("gunSCPFilter", {
-        Text = "指定 SCP 编号（空=全部SCP，如 173）", Default = "",
-        Callback = function(v) if G.GUNBOT then G.GUNBOT.SetSCPFilter(v) end end,
+    RA:AddToggle("rageTrace", {
+        Text = "弹道显示", Default = false,
+        Tooltip = "从人物（头部/身体）画一条到命中点的弹道",
+        Callback = function(v)
+            if G.RAGE_FX then G.RAGE_FX.SetTracer(v) end
+        end,
     })
-    GA:AddInput("gunDelay", {
-        Text = "射击间隔（秒）", Default = "0.08", Numeric = true,
-        Callback = function(v) if G.GUNBOT then G.GUNBOT.SetDelay(v) end end,
+    RA:AddDropdown("rageTracerStyle", {
+        Values = { "经典", "粗光晕", "细针", "霓虹", "3D 光束", "3D 脉冲" },
+        Default = 1,
+        Text = "弹道样式",
+        Tooltip = "经典/粗光晕/细针/霓虹 = 2D 描边线；3D 光束/3D 脉冲 = 实体光柱（执行器无 Drawing 时自动走 3D）",
+        Callback = function(v)
+            if G.RAGE_FX then G.RAGE_FX.SetTracerStyle(v) end
+        end,
     })
-    GA:AddInput("gunRange", {
-        Text = "最大距离（studs）", Default = "800", Numeric = true,
-        Callback = function(v) if G.GUNBOT then G.GUNBOT.SetRange(v) end end,
+    local rageSt = RA:AddLabel("状态：待命")
+
+    -- 右：队伍检测 / 攻击
+    local RB = TabAtk:AddRightGroupbox("rage", "crosshair")
+    RB:AddDropdown("rageTeam", {
+        Values = { "同队 + 旁观者（默认）", "仅同队", "仅旁观者", "全不检测" },
+        Default = 1,
+        Text = "队伍检测",
+        Tooltip = "默认同队与旁观者都不打；旁观者已内置，不单独设开关",
+        Callback = function(v)
+            if G.GUNBOT then G.GUNBOT.SetTeamMode(v) end
+        end,
     })
-    GA:AddInput("gunAimPart", {
-        Text = "瞄准部位", Default = "Head",
-        Callback = function(v) if G.GUNBOT then G.GUNBOT.SetAimPart(v) end end,
+    RB:AddDropdown("rageAtk", {
+        Values = { "SCP（默认）", "玩家", "全部" },
+        Default = 1,
+        Text = "攻击",
+        Callback = function(v)
+            if G.GUNBOT then G.GUNBOT.SetMode(v) end
+        end,
     })
-    GA:AddToggle("gunWall", {
-        Text = "射线检测墙壁", Default = true,
-        Callback = function(v) if G.GUNBOT then G.GUNBOT.SetWall(v) end end,
-    })
-    GA:AddToggle("gunTeam", {
-        Text = "同队不打", Default = true,
-        Callback = function(v) if G.GUNBOT then G.GUNBOT.SetTeam(v) end end,
-    })
-    GA:AddToggle("gunCam", {
-        Text = "射线起点用相机（第三人称准）", Default = true,
-        Callback = function(v) if G.GUNBOT then G.GUNBOT.SetFromCamera(v) end end,
-    })
-    GA:AddToggle("gunDeep", {
-        Text = "深度扫描 SCP（默认关·省性能）", Default = false,
-        Tooltip = "额外遍历 workspace 找带 SCP 编号属性的 Model，覆盖没打标签的 SCP",
-        Callback = function(v) if G.GUNBOT then G.GUNBOT.SetDeepScan(v) end end,
-    })
-    GA:AddToggle("gunFloat", {
-        Text = "显示浮动大按钮（手机）", Default = true,
-        Callback = function(v) if G.GUNBOT then G.GUNBOT.SetFloat(v) end end,
-    })
-    GA:AddButton({ Text = "⚡ 立即打一发", Func = function()
-        if G.GUNBOT then
-            local ok, t = G.GUNBOT.FireNow()
-            Library:Notify(ok and ("已发射 → " .. tostring(t)) or ("未发射：" .. tostring(t)), 2)
-        end
-    end })
-    GA:AddButton({ Text = "清零射击计数", Func = function()
-        if G.GUNBOT then G.GUNBOT.ResetCount() end
-        Library:Notify("射击计数已清零", 2)
-    end })
-    GA:AddLabel("诊断：getgenv().GUNBOT.Dump()｜彻底关闭：GUNBOT.Off()")
-    GA:AddLabel("命中由服务器裁决 · 穿墙发包可能被服务端重算丢弃")
-    GA:AddLabel("SCP 是 Model（标签/属性编号），玩家是 Player.Character")
-    local gaSt  = GA:AddLabel("状态：待命（默认关闭）")
-    local gaCnt = GA:AddLabel("发 0 · 错 0 · 目标 无 · 候选 0")
+
     task.spawn(function()
         while G.GUNBOT do
             pcall(function()
                 local g = G.GUNBOT
-                setLbl(gaSt, "状态：" .. tostring(g.Status)
-                    .. " · 远程 " .. (g.RemoteOK and "OK" or "NA")
-                    .. " · 模式 " .. tostring(g.Mode))
-                setLbl(gaCnt, "发 " .. tostring(g.Shots) .. " · 错 " .. tostring(g.Errors)
+                setLbl(rageSt, "状态：" .. tostring(g.Status)
                     .. " · 目标 " .. tostring(g.CurTarget)
-                    .. " · 候选 " .. tostring(g.Candidates))
+                    .. " · 弹 " .. tostring(g.Ammo == nil and "?" or g.Ammo)
+                    .. " · 发 " .. tostring(g.Shots)
+                    .. " · 错 " .. tostring(g.Errors))
             end)
             task.wait(0.5)
         end
@@ -7351,7 +9966,7 @@ local function buildNativeUI(pg)
     tabAtk.Position = UDim2.new(0.666, 0, 0, 36)
     tabAtk.BackgroundColor3 = TAB_OFF
     tabAtk.BorderSizePixel = 0
-    tabAtk.Text = "攻击"
+    tabAtk.Text = "rage"
     tabAtk.TextColor3 = Color3.fromRGB(200, 210, 225)
     tabAtk.Font = HEAVY
     tabAtk.TextSize = 13
@@ -7592,27 +10207,46 @@ local function buildNativeUI(pg)
     -- ===== SCP 透视子项（透视统一跟随主「SCP透视」总开关）=====
     makeHint(496, "─ SCP子项（跟随主「SCP透视」总开关）─", pageMain, 11, Color3.fromRGB(120, 210, 255))
     local rowStaff = makeToggle(514, "徽章NPC透视",
-        function() return G.STAFF_ESP and G.STAFF_ESP.CFG.UserEnabled or false end,
-        function(v) if G.STAFF_ESP then G.STAFF_ESP.SetUserEnabled(v) end end,
+        function()
+            if G.STAFFHUNT then return G.STAFFHUNT.Enabled end
+            return G.STAFF_ESP and G.STAFF_ESP.CFG.UserEnabled or false
+        end,
+        function(v)
+            if G.STAFFHUNT then pcall(function() G.STAFFHUNT.SetEnabled(v) end) end
+            if G.STAFF_ESP then pcall(function() G.STAFF_ESP.SetUserEnabled(false) end) end
+        end,
         pageMain)
     local row610 = makeToggle(550, "610 防护（防感染）",
         function() return G.SCP610_DEF and G.SCP610_DEF.AntiInfect or false end,
         function(v) if G.SCP610_DEF then G.SCP610_DEF.SetAnti(v) end end,
         pageMain)
+    local rowAutoTP = makeToggle(586, "徽章NPC自动传送",
+        function()
+            if G.STAFFHUNT then return G.STAFFHUNT.AutoTP end
+            return G.STAFF_ESP and G.STAFF_ESP.CFG.AutoTP or false
+        end,
+        function(v)
+            if G.STAFFHUNT and G.STAFFHUNT.SetTP then pcall(function() G.STAFFHUNT.SetTP(v) end) end
+            if G.STAFF_ESP then pcall(function() G.STAFF_ESP.SetTP(v) end) end
+        end,
+        pageMain)
 
-    local espSubSt = makeHint(586, "状态：等待模块…", pageMain, 10, Color3.fromRGB(160, 200, 230))
+    local espSubSt = makeHint(622, "状态：等待模块…", pageMain, 10, Color3.fromRGB(160, 200, 230))
     task.spawn(function()
         while gui.Parent do
             pcall(function()
                 local SE, SD = G.STAFF_ESP, G.SCP610_DEF
                 local on = G.CRATE_ESP and G.CRATE_ESP.SCPEnabled
-                espSubSt.Text = string.format("总开关:%s · 徽章:%s · 610:%s",
+                espSubSt.Text = string.format("总开关:%s · 徽章:%s · 610:%s · 传送:%s%s",
                     on and "开" or "关",
                     SE and (SE.CFG.Enabled and "显示" or "停") or "-",
-                    SD and (SD.AntiInfect and "防护开" or "防护关") or "-")
+                    SD and (SD.AntiInfect and "防护开" or "防护关") or "-",
+                    SE and (SE.CFG.AutoTP and "开" or "关") or "-",
+                    (SE and SE.State and SE.State.why) and ("(" .. SE.State.why .. ")") or "")
                 -- 总开关变化时把按钮显示拉回真实状态
                 if rowStaff.Sync then rowStaff.Sync() end
                 if row610.Sync then row610.Sync() end
+                if rowAutoTP.Sync then rowAutoTP.Sync() end
             end)
             task.wait(0.5)
         end
@@ -8113,7 +10747,8 @@ end)
 -- ============================================================
 -- 【内嵌】SCP-610 感染防护 + 新SCP透视（原独立脚本整合）
 -- 防护：感染度属性 SCP610Infection 一出现就清零；自身 SCP610Host 标签立即移除
--- 透视：610 宿主/感染体 + SCP610_Mother 核心；排除 999/131/106；500m 范围
+-- 透视：只画 610 宿主/感染体 + SCP610_Mother 核心；排除 999/131/106；500m 范围
+--       普通 SCP 一律交给主 ESP，避免同一只 SCP 出现两套标签（v16.4）
 -- 联动：受主界面「SCP透视」总开关控制（轮询 SCPEnabled，不包装主函数）
 -- API：G.SCP610_DEF.{On,Off,SetESP,SetAnti,SetRange,Dump}
 -- ============================================================
@@ -8244,9 +10879,16 @@ do
         end
     end
 
+    -- 【v16.4 修复·同一 SCP 两条透视】
+    -- 根因：这里原来把所有含 "SCP" 的 CollectionService 标签都收进来，
+    --   于是 SCP-4033/4035 这类普通 SCP 被本模块按标签画一条，
+    --   主 ESP 又画一条 → 屏幕上同一只 SCP 出现两套标签（距离差几米，
+    --   因为本模块用 part.Position、主 ESP 用 GetBoundingBox 中心）。
+    -- 本模块职责只有 610：只收含 "610" 的标签，其余交给主 ESP。
     local tagList = {}
     for _, t in ipairs(CS:GetAllTags()) do
-        if string.find(string.upper(t), "SCP", 1, true) then tagList[#tagList + 1] = t end
+        local u = string.upper(t)
+        if string.find(u, "610", 1, true) then tagList[#tagList + 1] = t end
     end
     for _, t in ipairs(tagList) do
         for _, o in ipairs(CS:GetTagged(t)) do trackObject(o) end
@@ -8334,6 +10976,8 @@ do
         local cam = WS.CurrentCamera
         if not cam then return end
         local cp = cam.CFrame.Position
+        -- 主 ESP 已经画了这个对象时，本模块不再重复画（跨模块去重兜底）
+        local E = Gg.CRATE_ESP
         for o, r in pairs(D.Marks) do
             if not o.Parent then
                 delMark(o)
@@ -8344,7 +10988,8 @@ do
                 end)
                 if pos then
                     local d = (cp - pos).Magnitude
-                    if d > D.Range then r.bg.Enabled = false
+                    local dup = E and E.Marks and (E.Marks[o] ~= nil)
+                    if dup or d > D.Range then r.bg.Enabled = false
                     else
                         r.bg.Enabled = true
                         local txt = r.label .. " " .. math.floor(d) .. "m"
@@ -8447,7 +11092,7 @@ do
         action  = "",
         fired   = 0,
         lastFire = {},      -- [prompt] = os.clock() 单点冷却，防连点重复触发
-        CoolDown = 0.25,
+        CoolDown = 0.1,       -- 瞬间互动：连点只做 0.1s 去抖
     }
 
     local pg = LP:FindFirstChild("PlayerGui") or LP:WaitForChild("PlayerGui")
@@ -8520,7 +11165,7 @@ do
         local last = S.lastFire[p]
         if last and (now - last) < S.CoolDown then return end
         S.lastFire[p] = now
-        local ok = pcall(function() FPP(p, 1, true) end)
+        local ok = pcall(function() FPP(p, 0.01, true) end)
         if ok then S.fired = S.fired + 1 end
     end
 
@@ -8651,7 +11296,8 @@ do
         local ch = LP.Character
         local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
         if not hrp then return false end
-        local ok, parts = pcall(function() return WS:GetPartBoundsInRadius(hrp.Position, 25) end)
+        -- 半径 18 足够覆盖 MaxActivationDistance(6~10)+容差；比 25 少扫一大片装饰件
+        local ok, parts = pcall(function() return WS:GetPartBoundsInRadius(hrp.Position, 18) end)
         if not ok or not parts then return false end
         local added = false
         for _, part in ipairs(parts) do
@@ -8681,7 +11327,7 @@ do
                     end
                 end
                 -- 没东西可点时，每 0.5s 扫一次附近常驻互动点
-                if not S.current and (os.clock() - lastScan) >= 0.5 then
+                if not S.current and (os.clock() - lastScan) >= 1.0 then
                     lastScan = os.clock()
                     if scanNearby() then changed = true end
                 end
@@ -8898,7 +11544,7 @@ do
     local CFG = {
         ScanInterval  = 0.5,
         Enabled       = true,
-        UserEnabled   = true,            -- 玩家自己这个开关；实际显示 = 本开关 AND 主「SCP透视」
+        UserEnabled   = false,           -- 旧内嵌 Staff 透视默认关：徽章NPC 统一由 STAFFHUNT v1.3 负责
         ShowNormal    = false,           -- 默认只显示 ★特殊 / ?可疑，屏幕更干净
         SpecialColor  = Color3.fromRGB(255, 55, 55),
         AbnormalColor = Color3.fromRGB(255, 150, 40),
@@ -8906,7 +11552,8 @@ do
         FillAlpha     = 0.55,
         MaxDistance   = 2000,
         NotifyNew     = true,
-        AutoTP        = false,           -- 默认不自动传送，避免打断操作
+        AutoTP        = true,            -- 默认自动传送（面板/API 可关）
+        TPAny         = true,            -- 没有 ★特殊时，也把 ?可疑 当作目标
         FirstTPDist   = 45,
         SafeDist      = 10,
         TeleportCD    = 2.5,
@@ -8936,6 +11583,7 @@ do
         on = false, derived = {}, known = {}, conn = nil, watchConn = nil,
         scanAt = 0, assetAt = 0, label = nil, status = "启动中…",
         target = nil, tpCount = 0, nextTP = 0, lastTP = "无", tpTotal = 0,
+        why = "待命",
         ownerAssets = {}, playerAssets = {}, playerNames = {}, Conns = {},
     }
     for k, v in pairs(OWNER_IDS) do S.ownerAssets[k] = v end
@@ -9169,12 +11817,22 @@ do
 
     local function canTP()
         if not CFG.AutoTP then return false, "自动传送已关闭" end
-        if LP2:GetAttribute("InRound") ~= true then return false, "不在回合中" end
+        -- 任务模式一律不传：会把正在做任务的角色从断路器/总闸旁拽走，全自动直接断
+        local okM, md = pcall(function()
+            return game:GetService("ReplicatedStorage"):GetAttribute("RoundMode")
+        end)
+        if okM and tostring(md) == "Escape" then return false, "任务模式(Escape)不自动传送" end
+        -- 只拦「明确不在回合」：InRound 属性很多模式根本不存在（实测 nil），
+        -- 旧写法 InRound ~= true 会直接判死，导致看到 NPC 却永不传送。
+        if LP2:GetAttribute("InRound") == false then return false, "不在回合中(InRound=false)" end
         if LP2:GetAttribute("Role") == "SCP" then return false, "本局你是 SCP" end
         if LP2:GetAttribute("Ghost") == true then return false, "当前是鬼魂/旁观" end
         local ch = LP2.Character
-        local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-        if not (ch and hum and hum.Health > 0) then return false, "角色未存活" end
+        if not ch or not ch.Parent then return false, "角色未生成" end
+        local hum = ch:FindFirstChildOfClass("Humanoid")
+        if not (hum and hum.Health > 0) then return false, "角色未存活" end
+        local root = myRoot()
+        if not root then return false, "取不到自身位置" end
         return true
     end
 
@@ -9182,19 +11840,26 @@ do
         local root = myRoot()
         if not root then return nil end
         local myPos = root.Position
-        local best, bestD = nil, math.huge
-        for m, e in pairs(S.derived) do
-            if e.tier == 2 and m.Parent then
-                local hum = m:FindFirstChildOfClass("Humanoid")
-                if (hum == nil) or hum.Health > 0 then
-                    local head = headOf(m)
-                    local p = head and head.Position or m:GetPivot().Position
-                    local d = (p - myPos).Magnitude
-                    if d < bestD then best, bestD = m, d end
+        local function scanTier(want)
+            local best, bestD = nil, math.huge
+            for m, e in pairs(S.derived) do
+                if e.tier == want and m.Parent then
+                    local hum = m:FindFirstChildOfClass("Humanoid")
+                    if (hum == nil) or hum.Health > 0 then
+                        local head = headOf(m)
+                        local p = head and head.Position or m:GetPivot().Position
+                        local d = (p - myPos).Magnitude
+                        if d < bestD then best, bestD = m, d end
+                    end
                 end
             end
+            return best, bestD
         end
-        return best, bestD
+        -- 优先 ★特殊（tier2）；没有再退到 ?可疑（tier1，TPAny 控制）
+        local t, d = scanTier(2)
+        if t then return t, d end
+        if CFG.TPAny then return scanTier(1) end
+        return nil
     end
 
     local function buildPool()
@@ -9286,26 +11951,29 @@ do
     end
 
     local function pursue()
-        if not CFG.AutoTP then return end
-        if not canTP() then return end
+        if not CFG.AutoTP then S.why = "自动传送已关闭" return end
+        local okTP, why = canTP()
+        if not okTP then S.why = why return end
         local target, dist = pickTarget()
-        if not target then S.target = nil return end
+        if not target then S.target = nil S.why = "场上无可传送目标" return end
         if S.target ~= target then
             S.target = target; S.tpCount = 0; S.nextTP = 0
         end
         local now = os.clock()
-        if dist <= CFG.FirstTPDist then return end
-        if now < S.nextTP then return end
-        if S.tpCount >= CFG.MaxTPPerTarget then return end
+        if dist <= CFG.FirstTPDist then S.why = string.format("已在 %dm 内，无需传送", math.floor(dist)) return end
+        if now < S.nextTP then S.why = string.format("冷却中(%.1fs)", S.nextTP - now) return end
+        if S.tpCount >= CFG.MaxTPPerTarget then S.why = "该目标已达传送上限" return end
         local done, err = tpTo(target)
         S.tpCount = S.tpCount + 1
         S.nextTP = now + CFG.TeleportCD
         if done then
             S.tpTotal = S.tpTotal + 1
+            S.why = "已传送"
             S.lastTP = string.format("已传送 %s（%d→%d格·第%d次）",
                 target.Name, math.floor(dist), CFG.SafeDist, S.tpCount)
             watch(target, CFG.WatchSeconds)
         else
+            S.why = "传送失败"
             S.lastTP = "传送失败：" .. tostring(err)
         end
     end
@@ -9322,15 +11990,21 @@ do
                 local tag = (e.tier == 2 and "★ SPECIAL")
                     or (e.tier == 1 and "? ABNORMAL") or m.Name
                 local extra = (e.tier ~= 0) and ("\n" .. e.reason) or ""
-                e.label.Text = string.format("%s  [%d]", tag, math.floor(d)) .. extra
+                local txt = string.format("%s  [%d]", tag, math.floor(d)) .. extra
+                if e.lastTxt ~= txt then
+                    e.lastTxt = txt
+                    e.label.Text = txt
+                end
             end
         end
     end
 
     local function dump()
         local pool = buildPool()
-        local lines = { string.format("[STAFF] v1.4 观察池=%d · 用户开关=%s · 生效=%s",
-            #pool, tostring(CFG.UserEnabled), tostring(CFG.Enabled)) }
+        local lines = { string.format("[STAFF] v1.5 观察池=%d · 用户开关=%s · 生效=%s · 自动传送=%s(任意可疑=%s)",
+            #pool, tostring(CFG.UserEnabled), tostring(CFG.Enabled),
+            tostring(CFG.AutoTP), tostring(CFG.TPAny)) }
+        lines[#lines + 1] = "自动传送状态：" .. tostring(S.why)
         local oa = 0 for _ in pairs(S.ownerAssets) do oa = oa + 1 end
         local pa = 0 for _ in pairs(S.playerAssets) do pa = pa + 1 end
         lines[#lines + 1] = string.format("作者资产=%d 玩家缓存=%d 最近=%s 特殊累计=%d",
@@ -9376,7 +12050,10 @@ do
                     scan()
                     pursue()
                 end
-                refreshTexts()
+                if now - (S.textAt or 0) >= 0.25 then
+                    S.textAt = now
+                    refreshTexts()
+                end
             end)
             if not ok then setStatus("透视出错：" .. tostring(err)) end
         end)
@@ -9432,7 +12109,8 @@ do
             CFG.UserEnabled = v and true or false
             return syncEnabled()
         end,
-        SetTP = function(v) CFG.AutoTP = v and true or false; return CFG.AutoTP end,
+        SetTP = function(v) CFG.AutoTP = v and true or false; S.nextTP = 0; S.tpCount = 0; return CFG.AutoTP end,
+        SetTPAny = function(v) CFG.TPAny = v and true or false; return CFG.TPAny end,
         SetWatch = function(v) CFG.AutoWatch = v and true or false; return CFG.AutoWatch end,
         SetNormal = function(v)
             CFG.ShowNormal = v and true or false
