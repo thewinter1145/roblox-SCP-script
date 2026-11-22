@@ -8716,7 +8716,7 @@ end
 -- ============================================================
 -- 饮水机 / 饮料机 透视（独立轻量模块 · 零 hook · 零元表）
 -- 判据：物件名 或 互动按钮(ProximityPrompt) 文案含 water/cooler/dispenser/
---       drink/饮料/饮水 等词；名字含 294 的按「饮料机 SCP-294」标
+--       drink/饮料/饮水 等词；294 的机器交给「新SCP透视」标 SCP-294，这里不重复画
 -- 诊断：getgenv().WATER_ESP.Dump()
 -- ============================================================
 do
@@ -8783,6 +8783,44 @@ do
             local d = desc[i]
             local okC, isP = pcall(function() return d:IsA("ProximityPrompt") end)
             if okC and isP and strictPrompt(d) then return true end
+        end
+        return false
+    end
+
+    local CSvc294 = game:GetService("CollectionService")
+    -- 294 归「新SCP透视」管（它标 SCP-294），饮水机模块不再重复画
+    local function is294(o)
+        -- 自己或最近 3 层父级：名字含 294 / 带 SCP294 标签，都算 294 的机器
+        local cur = o
+        for _ = 1, 4 do
+            local nm2 = ""
+            pcall(function() nm2 = tostring(cur.Name) end)
+            if string.find(nm2, "294", 1, true) then return true end
+            local tagHit = false
+            pcall(function()
+                for _, t in ipairs(CSvc294:GetTags(cur)) do
+                    if string.find(tostring(t), "294", 1, true) then tagHit = true; break end
+                end
+            end)
+            if tagHit then return true end
+            local p
+            pcall(function() p = cur.Parent end)
+            if not p or p == WS then break end
+            cur = p
+        end
+        local ok, desc = pcall(function() return o:GetDescendants() end)
+        if ok and desc then
+            local n = #desc
+            if n > 80 then n = 80 end
+            for i = 1, n do
+                local d = desc[i]
+                local okC, isP = pcall(function() return d:IsA("ProximityPrompt") end)
+                if okC and isP then
+                    local txt = ""
+                    pcall(function() txt = tostring(d.ActionText) .. " " .. tostring(d.ObjectText) end)
+                    if string.find(txt, "294", 1, true) then return true end
+                end
+            end
         end
         return false
     end
@@ -8913,7 +8951,7 @@ do
         for _ in pairs(W.Marks) do marked = marked + 1 end
 
         for o in pairs(found) do
-            local part = anchorOf(o)
+            local part = (not is294(o)) and anchorOf(o) or nil
             if part then
                 if W.Marks[o] then
                     W.Marks[o].part = part
@@ -8921,8 +8959,7 @@ do
                 elseif marked < 60 then
                     local nm
                     pcall(function() nm = o.Name end)
-                    local base = string.find(low(nm), "294", 1, true)
-                        and "饮料机 SCP-294" or ("饮水机 · " .. tostring(nm))
+                    local base = "饮水机 · " .. tostring(nm)
                     setMark(o, part, base)
                     marked = marked + 1
                 end
