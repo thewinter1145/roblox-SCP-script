@@ -2332,16 +2332,31 @@ pcall(function() G.classifySCP = classifySCP end)
 -- ESP 专用：这几号一律不画框（999 友好史莱姆 / 131 眼球 / 005 钥匙）
 -- 只挡「显示」；isLocalSCP / GUNBOT / 自动技能仍用原 classifySCP，行为不变
 local ESP_HIDE_NUMS = { ["999"] = true, ["131"] = true, ["005"] = true }
-local function classifyForESP(m)
-    local label = classifySCP(m)
-    if not label then return nil end
-    local n = string.match(label, "^SCP%-(%d%d+)$")
-    if n and ESP_HIDE_NUMS[n] then return nil end
+-- label 可能是 "SCP-999"，也可能是原始模型名 "SCP999_Model"，两种都要认
+local function labelHidden(label)
+    if not label then return false end
     local c = compact(label)
     for k in pairs(ESP_HIDE_NUMS) do
-        if c == "scp" .. k then return nil end
+        local pat = "scp" .. k
+        local i = 1
+        while true do
+            i = string.find(c, pat, i, true)
+            if not i then break end
+            local nxt = string.sub(c, i + #pat, i + #pat)
+            if not string.match(nxt, "%d") then return true end
+            i = i + 1
+        end
     end
+    return false
+end
+local function classifyForESP(m)
+    local label = classifySCP(m)
+    if labelHidden(label) then return nil end
     return label
+end
+-- 原分类命中被隐藏编号（用于挡「玩家透视」把它当普通玩家画出来）
+local function hiddenSCP(m)
+    return labelHidden(classifySCP(m))
 end
 pcall(function() G.classifyForESP = classifyForESP end)
 
@@ -2397,6 +2412,44 @@ do
         HuntCheckInterval = 3.0, FullScanInterval = 12.0,   -- 兜底全扫；新对象走 DescendantAdded
     }
     G.CRATE_ESP = ESP
+
+    -- 重注入清扫：上一版脚本的循环已停，但 Highlight / 标签还挂在模型上（这正是
+    -- 「新版本明明过滤了 999/131，游戏里还看得见」的常见原因）。启动 2 秒后跑一次，
+    -- 只删不属于当前实例的旧标签，不影响本次新建的。
+    task.delay(2, function()
+        pcall(function()
+            local keep = {}
+            for _, rec in pairs(ESP.Marks) do
+                if rec.hl then keep[rec.hl] = true end
+                if rec.bg then keep[rec.bg] = true end
+            end
+            local N = G.NEWSCP_ESP
+            if N and N.Marked then
+                for _, rec in pairs(N.Marked) do if rec.bg then keep[rec.bg] = true end end
+            end
+            local W = G.WATER_ESP
+            if W and W.Marks then
+                for _, rec in pairs(W.Marks) do if rec.bg then keep[rec.bg] = true end end
+            end
+            local killed = 0
+            local function sweep(root)
+                local ok, desc = pcall(function() return root:GetDescendants() end)
+                if not ok or not desc then return end
+                for i = 1, #desc do
+                    local obj = desc[i]
+                    local n = obj.Name
+                    if (n == "MCP_ESP_HL" or n == "MCP_ESP_BG"
+                        or n == "NS_BB" or n == "WATER_BB") and not keep[obj] then
+                        pcall(function() obj:Destroy() end)
+                        killed = killed + 1
+                    end
+                end
+            end
+            sweep(WS)
+            pcall(function() sweep(game:GetService("CoreGui")) end)
+            if killed > 0 then print("[ESP] 已清理上一版残留标签 " .. killed .. " 个") end
+        end)
+    end)
     local CSvc = game:GetService("CollectionService")
 
     local function isMine(m)
@@ -2700,6 +2753,10 @@ do
         if rec.kind == "player" and rec.player and isSpectator(rec.player, m) then
             destroy(m, rec) return
         end
+        -- 999 / 131 / 005 即使被判成「玩家」也不画（慢检顺带清掉旧标签）
+        if slow and rec.kind == "player" and hiddenSCP(m) then
+            destroy(m, rec) return
+        end
         if slow and rec.kind == "scp" then
             -- 残留壳 / 尸体：直接销毁，不走 3 次 miss 计数（约 4.5s 延迟）
             if isInactiveBody(m) then destroy(m, rec) return end
@@ -2859,7 +2916,7 @@ do
                             local sl = classifyForESP(ch)
                             if sl then
                                 if not hunt then add(ch, "scp", sl) end
-                            elseif ESP.PlayerEnabled then
+                            elseif ESP.PlayerEnabled and not hiddenSCP(ch) then
                                 add(ch, "player", pl.Name)
                             end
                         end
@@ -2965,7 +3022,7 @@ do
                         local sl = classifyForESP(d)
                         if sl then
                             if not ESP.HuntMode then add(d, "scp", sl) end
-                        elseif ESP.PlayerEnabled then
+                        elseif ESP.PlayerEnabled and not hiddenSCP(d) then
                             add(d, "player", pl.Name)
                         end
                     end
@@ -8978,6 +9035,8 @@ do
     local OUTLINE = Color3.new(0, 0, 0)
 
     -- 装饰后缀：不单独透视（Cup 让 294 杯子不刷屏）
+    -- 这几号一律不标（999 友好 / 131 眼球 / 005 钥匙），所有路径都在 addMark 处兜底
+    local HIDE_NUMS = { ["999"] = true, ["131"] = true, ["005"] = true }
     local SKIP_SUFFIX = { "Cup", "FeedScreen", "Passable", "Sinkhole", "Feed", "Screen",
                           "Dragon", "Follower", "Cable", "Conduit", "Wire" }
     local DEAD_KW     = { "corpse", "ragdoll", "dead", "remains", "oldbody", "debris" }
@@ -9130,6 +9189,9 @@ do
     end
 
     local function addMark(o, label, src)
+        -- 最后一道闸：999 / 131 / 005 不管从哪条路径来都不标
+        local hn = string.match(tostring(label or ""), "SCP%-(%d%d+)")
+        if hn and HIDE_NUMS[hn] then return end
         if ESP.Marked[o] then return end
         if nearDuplicate(o, label) then return end
         local bg = Instance.new("BillboardGui")
@@ -9170,7 +9232,6 @@ do
     end
 
     -- 统一门槛：带场景词的一律不标；非道具只接受「名字本身就是 SCP<编号>」
-    local HIDE_NUMS = { ["999"] = true, ["131"] = true, ["005"] = true }
     local function acceptable(o, label)
         local num = string.match(tostring(label or ""), "^SCP%-(%d%d+)$")
         if num and HIDE_NUMS[num] then return false end
