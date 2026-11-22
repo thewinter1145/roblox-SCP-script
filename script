@@ -2840,6 +2840,49 @@ do
         end)
     end
 
+    -- 【v16.3 修复·同一 SCP 显示两套标签】
+    -- 根因：fullScan 对 Workspace 里每个 Model 都跑 classifySCP，
+    --   而 4033 这类 SCP 是「父 Model + 内部子 Model」或多部件结构，
+    --   父子各命中一次 → 同编号画两条标签，距离差几米（如 200m / 205m）。
+    -- 处理：同编号且两个标记的实体位置相距 < DEDUP_R 时，只保留最近的一条标签；
+    --   相距很远（真正刷了两只）则都保留。只隐藏 BillboardGui，保留 Highlight 轮廓。
+    local DEDUP_R = 10
+    local function dedupeSCPLabels()
+        local cam = WS.CurrentCamera
+        if not cam then return end
+        local list = {}
+        for m, rec in pairs(ESP.Marks) do
+            if rec.kind == "scp" and rec.bg and m.Parent then
+                local pos
+                if rec.host and rec.host:IsA("BasePart") then
+                    pos = rec.host.Position
+                elseif rec.host and rec.host:IsA("Model") then
+                    local ok, cf = pcall(function() return rec.host:GetBoundingBox() end)
+                    pos = ok and cf and cf.Position or nil
+                end
+                if pos then
+                    list[#list + 1] = {
+                        rec = rec, pos = pos, label = rec.label,
+                        d = (cam.CFrame.Position - pos).Magnitude,
+                    }
+                end
+            end
+        end
+        for _, e in ipairs(list) do
+            if e.rec.bg.Enabled ~= true then e.rec.bg.Enabled = true end
+        end
+        for i = 1, #list do
+            for j = i + 1, #list do
+                local A, B = list[i], list[j]
+                if A.label and B.label and A.label == B.label
+                    and (A.pos - B.pos).Magnitude < DEDUP_R then
+                    local far = (A.d >= B.d) and A or B
+                    if far.rec.bg.Enabled then far.rec.bg.Enabled = false end
+                end
+            end
+        end
+    end
+
     local acc, sacc, hacc, facc = 0, 0, 0, 0
     ESP.Heartbeat = RUS.Heartbeat:Connect(function(dt)
         if not ESP.Enabled then return end
@@ -2857,6 +2900,7 @@ do
             local slow = sacc >= ESP.RecheckInterval
             if slow then sacc = 0 end
             for m, rec in pairs(ESP.Marks) do pcall(refresh, m, rec, slow) end
+            pcall(dedupeSCPLabels)
         end
     end)
 
@@ -2945,6 +2989,30 @@ do
         end)
         print(string.format("[ESP] 035候选数=%d · SCPEnabled=%s HuntMode=%s Enabled=%s",
             cnt, tostring(ESP.SCPEnabled), tostring(ESP.HuntMode), tostring(ESP.Enabled)))
+    end
+
+    -- 诊断：控制台执行 getgenv().CRATE_ESP.DumpSCP()
+    -- 列出当前每个 SCP 标记的模型全名 / 标签 / 距离 / 标签是否被去重隐藏
+    ESP.DumpSCP = function()
+        local cam = WS.CurrentCamera
+        local n, hidden = 0, 0
+        for m, rec in pairs(ESP.Marks) do
+            if rec.kind == "scp" then
+                n = n + 1
+                local pos
+                if rec.host and rec.host:IsA("BasePart") then pos = rec.host.Position
+                elseif rec.host and rec.host:IsA("Model") then
+                    local ok, cf = pcall(function() return rec.host:GetBoundingBox() end)
+                    pos = ok and cf and cf.Position or nil
+                end
+                local d = (cam and pos) and math.floor((cam.CFrame.Position - pos).Magnitude) or -1
+                local vis = rec.bg and rec.bg.Enabled
+                if not vis then hidden = hidden + 1 end
+                print(string.format("[ESP] SCP标记 %s | 标签=%s | %dm | 显示=%s",
+                    m:GetFullName(), tostring(rec.label), d, tostring(vis)))
+            end
+        end
+        print(string.format("[ESP] SCP标记数=%d · 去重隐藏=%d · DEDUP_R=%dm", n, hidden, DEDUP_R))
     end
 
     -- 诊断：控制台执行 getgenv().CRATE_ESP.DumpPlayers()
@@ -8304,10 +8372,11 @@ do
 end
 
 -- ============================================================
--- 【内嵌】互动修复 INTERACTFIX（原生手指图标 + 可拖动 + 秒互动）
--- 秒互动：靠近可互动对象即自动触发（Auto 默认开）；图标仍显示可拖动，轻点也可触发
+-- 【内嵌】互动修复 INTERACTFIX（原生手指图标 + 可拖动 + 点击才互动）
+-- 行为：靠近可互动对象 → 出现手指图标；玩家点图标 → 立即触发一次
+--       全程无自动触发，不做"靠近就互动"
 -- 原则：不修改游戏原生按钮/TouchGui/界面层，不影响视角与走路
--- API：G.INTERACTFIX.{On,Off,SetAuto,SetPos,ResetPos,Dump}
+-- API：G.INTERACTFIX.{On,Off,SetPos,ResetPos,Dump}
 -- ============================================================
 do
     local Gg = getgenv()
@@ -8322,11 +8391,10 @@ do
 
     local S = {
         Enabled = true,
-        Auto    = true,     -- 秒互动：可互动即自动触发
         current = nil,
         action  = "",
         fired   = 0,
-        lastFire = {},      -- [prompt] = os.clock() 单点冷却，防狂刷
+        lastFire = {},      -- [prompt] = os.clock() 单点冷却，防连点重复触发
         CoolDown = 0.25,
     }
 
@@ -8404,9 +8472,8 @@ do
         if ok then S.fired = S.fired + 1 end
     end
 
-    local function trigger()
-        firePrompt(S.current)
-    end
+    -- 互动只走「点按钮」这一条路，不做任何自动触发
+    local trigger
 
     -- 拖动
     local dragging, moved = false, false
@@ -8439,7 +8506,7 @@ do
         dragging = false
         if moved then
             Gg.INTERACTFIX_POS = Vector2.new(btn.Position.X.Offset, btn.Position.Y.Offset)
-        else
+        elseif trigger then
             trigger()
         end
     end)
@@ -8476,6 +8543,20 @@ do
     end
 
     local active = {}
+
+    -- 点击即互动：优先打当前点；若 current 已失效（刚被隐藏），立刻重挑一个有效点再打
+    trigger = function()
+        local p = S.current
+        if not (p and isAlive(p) and not isIgnored(p)) then
+            p = nil
+            for q in pairs(active) do
+                if isAlive(q) and not isIgnored(q) then p = q; break end
+            end
+            S.current = p
+        end
+        firePrompt(p)
+    end
+
     local function refreshUI()
         local pick = nil
         for p in pairs(active) do
@@ -8502,8 +8583,7 @@ do
         if not (prompt and prompt:IsA("ProximityPrompt")) then return end
         active[prompt] = true
         refreshUI()
-        -- 秒互动：出现即触发
-        if S.Auto and not isIgnored(prompt) then firePrompt(prompt) end
+        -- 只登记、不触发：必须由玩家点按钮才互动
     end)
     local hiddenConn = PPS.PromptHidden:Connect(function(prompt)
         active[prompt] = nil
@@ -8511,7 +8591,32 @@ do
         refreshUI()
     end)
 
-    -- 兜底轮询：0.12s，清理失效 + 秒互动自动触发（防 PromptShown 不触发的常驻点）
+    -- 兜底扫描：玩家附近 25m 内已存在的 ProximityPrompt 直接登记（不触发）
+    -- 部分常驻点不会再发 PromptShown，不补登记就会"有互动但图标不出现"
+    local WS = workspace
+    local lastScan = 0
+    local function scanNearby()
+        local ch = LP.Character
+        local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+        if not hrp then return false end
+        local ok, parts = pcall(function() return WS:GetPartBoundsInRadius(hrp.Position, 25) end)
+        if not ok or not parts then return false end
+        local added = false
+        for _, part in ipairs(parts) do
+            local okD, desc = pcall(function() return part:GetDescendants() end)
+            if okD and desc then
+                for _, o in ipairs(desc) do
+                    if o:IsA("ProximityPrompt") and not active[o]
+                        and isAlive(o) and not isIgnored(o) then
+                        active[o] = true; added = true
+                    end
+                end
+            end
+        end
+        return added
+    end
+
+    -- 兜底轮询：0.12s，只做「清理失效点 + 补显示」，不触发任何互动
     local guardTask = task.spawn(function()
         while true do
             task.wait(0.12)
@@ -8521,11 +8626,14 @@ do
                 for p in pairs(active) do
                     if not isAlive(p) or isIgnored(p) then
                         active[p] = nil; changed = true
-                    elseif S.Auto then
-                        firePrompt(p)   -- 秒互动兜底：有效可互动点直接触发
                     end
                 end
-                if changed then pcall(refreshUI) end
+                -- 没东西可点时，每 0.5s 扫一次附近常驻互动点
+                if not S.current and (os.clock() - lastScan) >= 0.5 then
+                    lastScan = os.clock()
+                    if scanNearby() then changed = true end
+                end
+                if changed or not S.current then pcall(refreshUI) end
             end
         end
     end)
@@ -8541,7 +8649,11 @@ do
         S.current = nil; S.action = ""
         pcall(function() btn.Visible = false end)
     end
-    function S.SetAuto(v) S.Auto = v and true or false; return S.Auto end
+    -- 兼容旧调用：自动互动已彻底移除，开启无效
+    function S.SetAuto()
+        print("[INTERACTFIX] 自动互动已移除，只支持点按钮互动")
+        return false
+    end
     function S.SetPos(x, y)
         local v = vp()
         local px = math.floor(x * v.X - SZ / 2)
@@ -8556,11 +8668,723 @@ do
     end
     function S.Dump()
         print(string.format(
-            "[INTERACTFIX] Enabled=%s Auto=%s FPP=%s fired=%d action=%s pos=(%d,%d)",
-            tostring(S.Enabled), tostring(S.Auto), tostring(FPP ~= nil), S.fired, S.action,
+            "[INTERACTFIX] Enabled=%s Mode=ClickOnly FPP=%s fired=%d action=%s pos=(%d,%d)",
+            tostring(S.Enabled), tostring(FPP ~= nil), S.fired, S.action,
             btn.Position.X.Offset, btn.Position.Y.Offset))
     end
 
     Gg.INTERACTFIX = S
-    print("[ESP] 互动修复已内嵌装载 · 秒互动 · 原生手指图标 · 可拖动")
+    print("[ESP] 互动修复已内嵌装载 · 仅点按钮互动（无自动触发）· 原生手指图标 · 可拖动")
+end
+
+-- ============================================================
+-- 【内嵌】SCP-610 自动挣脱（被抓取时自动切嫩芽，3 次命中后挣脱）
+-- 机制（反编译实证）：被抓时角色属性 SCP610GrabStart/Seed/Cuts/Misses，
+--   用游戏自己的 SCP610Config.PressHits(seed,cuts,dt) 找命中时刻，到点发
+--   Remotes.SCP610:FireServer("Cut", ServerNow)；命中 CUTS_NEEDED=3 次即挣脱。
+--   不 hook、不碰界面、不改数值。
+-- API：G.SCP610_BREAKFREE.{On,Off,Dump}
+-- ============================================================
+do
+    local Gg = getgenv()
+    if Gg.SCP610_BREAKFREE and Gg.SCP610_BREAKFREE.Off then pcall(Gg.SCP610_BREAKFREE.Off) end
+
+    local Players = game:GetService("Players")
+    local RS      = game:GetService("ReplicatedStorage")
+    local LP      = Players.LocalPlayer
+
+    local B = {
+        Enabled     = true,
+        Conns       = {},
+        Breaks      = 0,
+        CutsSent    = 0,
+        LastState   = "待命",
+        GrabAttr    = "SCP610GrabStart",
+        SeedAttr    = "SCP610GrabSeed",
+        CutsAttr    = "SCP610GrabCuts",
+    }
+    Gg.SCP610_BREAKFREE = B
+
+    local cfg = nil
+    pcall(function() cfg = require(RS.SharedModules.SCP610Config) end)
+    if not cfg or type(cfg.PressHits) ~= "function" then
+        B.LastState = "Config 未就绪（等待）"
+    end
+
+    local rem = RS:FindFirstChild("Remotes")
+    local fire = rem and rem:FindFirstChild("SCP610")
+
+    local function findHitDt(seed, cuts, fromDt)
+        if not cfg then return nil end
+        local step = 0.01
+        local maxT = fromDt + 4
+        local t = fromDt
+        while t <= maxT do
+            local ok, hit = pcall(function() return cfg.PressHits(seed, cuts, t) end)
+            if ok and hit then return t end
+            t = t + step
+        end
+        return nil
+    end
+
+    local active = false
+    local function doBreakfree(ch)
+        if active then return end
+        active = true
+        B.LastState = "挣脱中"
+        task.spawn(function()
+            local lastFire = 0
+            while B.Enabled and active do
+                local ch2 = LP and LP.Character
+                if not ch2 then break end
+                local startedAt = ch2:GetAttribute(B.GrabAttr)
+                if type(startedAt) ~= "number" then break end
+                if not cfg then pcall(function() cfg = require(RS.SharedModules.SCP610Config) end) end
+                if not fire then fire = rem and rem:FindFirstChild("SCP610") end
+                if not cfg or not fire then
+                    task.wait(0.2)
+                else
+                    local seed = ch2:GetAttribute(B.SeedAttr) or 0
+                    local cuts = ch2:GetAttribute(B.CutsAttr) or 0
+                    local now = workspace:GetServerTimeNow()
+                    local dt = now - startedAt
+                    if now - lastFire >= 0.18 then
+                        local hit = findHitDt(seed, cuts, dt)
+                        if hit then
+                            local targetDt = hit + 0.02
+                            local waitS = targetDt - dt
+                            if waitS > 0 and waitS < 1 then task.wait(waitS) end
+                            local n2 = workspace:GetServerTimeNow()
+                            local c2 = ch2:GetAttribute(B.CutsAttr) or 0
+                            local d2 = n2 - (ch2:GetAttribute(B.GrabAttr) or startedAt)
+                            local okc, hit2 = pcall(function() return cfg.PressHits(seed, c2, d2) end)
+                            if (okc and hit2) or (c2 > cuts) then
+                                pcall(function() fire:FireServer("Cut", n2) end)
+                                B.CutsSent = B.CutsSent + 1
+                                lastFire = n2
+                                B.LastState = "切断 " .. c2 .. "/3"
+                            end
+                        end
+                    end
+                    task.wait(0.03)
+                end
+            end
+            active = false
+            if B.Enabled then
+                B.Breaks = B.Breaks + 1
+                B.LastState = "已挣脱"
+            end
+        end)
+    end
+
+    local function watchChar(ch)
+        if not ch then return end
+        table.insert(B.Conns, ch:GetAttributeChangedSignal(B.GrabAttr):Connect(function()
+            if not B.Enabled then return end
+            local v = ch:GetAttribute(B.GrabAttr)
+            if type(v) == "number" then doBreakfree(ch) end
+        end))
+        local v = ch:GetAttribute(B.GrabAttr)
+        if type(v) == "number" then task.defer(doBreakfree, ch) end
+    end
+
+    if LP then
+        table.insert(B.Conns, LP.CharacterAdded:Connect(function(ch) task.defer(watchChar, ch) end))
+        if LP.Character then task.defer(watchChar, LP.Character) end
+    end
+
+    B.On = function()
+        B.Enabled = true
+        if LP and LP.Character then task.defer(watchChar, LP.Character) end
+    end
+    B.Off = function()
+        B.Enabled = false
+        active = false
+        for _, c in ipairs(B.Conns) do pcall(function() c:Disconnect() end) end
+        B.Conns = {}
+    end
+    B.Dump = function()
+        return string.format("BREAKFREE Enabled=%s Cuts=%d Breaks=%d State=%s cfg=%s fire=%s",
+            tostring(B.Enabled), B.CutsSent, B.Breaks, B.LastState,
+            tostring(type(cfg) == "table"), tostring(fire ~= nil))
+    end
+
+    print("[ESP] SCP610 自动挣脱 已内嵌装载 · " .. B.Dump())
+end
+
+-- ============================================================
+-- 【内嵌】特殊研究员透视 STAFF_ESP（能发隐藏徽章的 NPC）
+-- 目标：StaffConfig 里两个会发徽章的特殊 NPC
+--   OwnerScientist → Self-Insert  徽章（需 50 格内看见）
+--   Doppelganger   → Doppelgänger 徽章
+--   两者每局约 0.01% 概率，只在回合里 workspace.Staff 下刷。
+-- 判据（实测 43 个普通员工全部为 0 资产）：
+--   普通员工 HumanoidDescription 的所有资产字段恒为 0；
+--   套了玩家/作者头像的特殊 NPC 必有非 0 资产 → 硬判据。
+-- API：G.STAFF_ESP.{SetEnabled,Dump,TPNow,SetTP,SetNormal,State,CFG}
+-- ============================================================
+do
+    local Gg = getgenv()
+    pcall(function()
+        local old = Gg.STAFF_ESP
+        if old and old.Stop then pcall(old.Stop) end
+    end)
+    -- 兼容旧版全局名
+    pcall(function()
+        local old = _G.StaffESP
+        if old and old.Stop then pcall(old.Stop) end
+    end)
+
+    local Players           = game:GetService("Players")
+    local RunService        = game:GetService("RunService")
+    local CollectionService = game:GetService("CollectionService")
+    local UserInputService  = game:GetService("UserInputService")
+    local StarterGui        = game:GetService("StarterGui")
+    local WSS               = workspace
+    local LP2               = Players.LocalPlayer
+
+    local CFG = {
+        ScanInterval  = 0.5,
+        Enabled       = true,
+        ShowNormal    = false,           -- 默认只显示 ★特殊 / ?可疑，屏幕更干净
+        SpecialColor  = Color3.fromRGB(255, 55, 55),
+        AbnormalColor = Color3.fromRGB(255, 150, 40),
+        NormalColor   = Color3.fromRGB(90, 220, 140),
+        FillAlpha     = 0.55,
+        MaxDistance   = 2000,
+        NotifyNew     = true,
+        AutoTP        = false,           -- 默认不自动传送，避免打断操作
+        FirstTPDist   = 45,
+        SafeDist      = 10,
+        TeleportCD    = 2.5,
+        MaxTPPerTarget= 8,
+        AutoWatch     = false,           -- 默认不锁镜头
+        WatchSeconds  = 4,
+        ToggleKey     = Enum.KeyCode.H,
+        TPKey         = Enum.KeyCode.T,
+    }
+
+    local KNOWN_ROLES  = { Guard = true, Scientist = true, Janitor = true }
+    local KNOWN_PREFIX = { Guard = true, Janitor = true, Researcher = true }
+    local KEYWORDS = { "owner", "doppel", "avatar", "cameo", "dev", "special",
+                       "unique", "badge", "selfinsert", "self_insert" }
+    local ASSET_FIELDS = { "Head", "Face", "Shirt", "Pants", "GraphicTShirt",
+                           "Torso", "LeftArm", "RightArm", "LeftLeg", "RightLeg" }
+    local OWNER_IDS = {
+        [136280735368962] = "Buffer.Head", [7049758241] = "Buffer.Shirt",
+        [7156542047] = "Buffer.Pants", [101490994547910] = "Zion.Head",
+        [110376114001169] = "Zion.Shirt", [116139827578394] = "Zion.Pants",
+        [113567168434076] = "Zion.Torso", [84780766579093] = "Zion.LeftArm",
+        [78241712099906] = "Zion.RightArm", [94305080976284] = "Zion.LeftLeg",
+    }
+    local OWNER_USERS = { 4891465608, 9237209883 }
+
+    local S = {
+        on = false, derived = {}, known = {}, conn = nil, watchConn = nil,
+        scanAt = 0, assetAt = 0, label = nil, status = "启动中…",
+        target = nil, tpCount = 0, nextTP = 0, lastTP = "无", tpTotal = 0,
+        ownerAssets = {}, playerAssets = {}, playerNames = {}, Conns = {},
+    }
+    for k, v in pairs(OWNER_IDS) do S.ownerAssets[k] = v end
+
+    local function attrsOf(m)
+        local o = {}
+        for k, v in pairs(m:GetAttributes()) do o[#o + 1] = k .. "=" .. tostring(v) end
+        return o
+    end
+    local function headOf(m)
+        return m:FindFirstChild("Head") or m.PrimaryPart
+            or m:FindFirstChild("HumanoidRootPart") or m:FindFirstChild("Torso")
+    end
+    local function myRoot()
+        local ch = LP2.Character
+        return ch and (ch.PrimaryPart or ch:FindFirstChild("HumanoidRootPart") or nil)
+    end
+    local function assetsOf(m)
+        local hd
+        for _, d in ipairs(m:GetDescendants()) do
+            if d:IsA("HumanoidDescription") then hd = d break end
+        end
+        if not hd then return nil, {} end
+        local ids = {}
+        for _, f in ipairs(ASSET_FIELDS) do
+            local ok, v = pcall(function() return hd[f] end)
+            if ok and type(v) == "number" and v ~= 0 then ids[#ids + 1] = v end
+        end
+        return hd, ids
+    end
+
+    local function refreshAssets()
+        local now = os.clock()
+        if now - S.assetAt < 60 then return end
+        S.assetAt = now
+        task.spawn(function()
+            for _, uid in ipairs(OWNER_USERS) do
+                local ok, d = pcall(function() return Players:GetHumanoidDescriptionFromUserId(uid) end)
+                if ok and d then
+                    for _, f in ipairs(ASSET_FIELDS) do
+                        local ok2, v = pcall(function() return d[f] end)
+                        if ok2 and type(v) == "number" and v ~= 0 then
+                            S.ownerAssets[v] = (f == "Head" and "作者.Head" or "作者." .. f)
+                        end
+                    end
+                end
+            end
+            local names = {}
+            for _, p in ipairs(Players:GetPlayers()) do
+                local nm = string.lower(p.Name)
+                names[nm] = true
+                local dn = string.lower(p.DisplayName or "")
+                if #dn >= 4 then names[dn] = true end
+                if not S.playerAssets[p.UserId] then
+                    local ok, d = pcall(function() return Players:GetHumanoidDescriptionFromUserId(p.UserId) end)
+                    if ok and d then
+                        local set = {}
+                        for _, f in ipairs(ASSET_FIELDS) do
+                            local ok2, v = pcall(function() return d[f] end)
+                            if ok2 and type(v) == "number" and v ~= 0 then set[v] = true end
+                        end
+                        S.playerAssets[p.UserId] = set
+                    end
+                end
+            end
+            S.playerNames = names
+        end)
+    end
+
+    local function classify(m)
+        local strong, weak = {}, {}
+        local function S1(x) strong[#strong + 1] = x end
+        local function W1(x) weak[#weak + 1] = x end
+
+        local hd, ids = assetsOf(m)
+        if hd and #ids > 0 then
+            local hitOwner, hitPlayerUid
+            for _, id in ipairs(ids) do
+                if S.ownerAssets[id] then hitOwner = S.ownerAssets[id] end
+                for uid, set in pairs(S.playerAssets) do
+                    if set[id] then hitPlayerUid = uid end
+                end
+            end
+            if hitOwner then
+                S1("★作者头像 " .. hitOwner .. "（资产" .. #ids .. "项）")
+            elseif hitPlayerUid then
+                S1("★复刻玩家 UID=" .. tostring(hitPlayerUid) .. "（资产" .. #ids .. "项）")
+            else
+                S1("描述带资产×" .. #ids)
+            end
+        end
+
+        for k, v in pairs(m:GetAttributes()) do
+            local hay = string.lower(tostring(k)) .. "=" .. string.lower(tostring(v))
+            for _, kw in ipairs(KEYWORDS) do
+                if string.find(hay, kw, 1, true) then
+                    S1(tostring(k) .. "=" .. tostring(v)); break
+                end
+            end
+        end
+
+        local role = m:GetAttribute("StaffRole")
+        if role == nil then S1("无StaffRole")
+        elseif not KNOWN_ROLES[role] then S1("StaffRole=" .. tostring(role)) end
+        if m:GetAttribute("Staff") ~= true then S1("Staff≠true") end
+
+        local hum = m:FindFirstChildOfClass("Humanoid")
+        if hum and hum.RigType ~= Enum.HumanoidRigType.R6 then W1("R15") end
+        if m:GetAttribute("StaffArchetype") == nil then W1("无StaffArchetype") end
+        local pfx = string.match(m.Name, "^(%a+)")
+        if pfx and not KNOWN_PREFIX[pfx] then W1("名前缀=" .. pfx) end
+        local lname = string.lower(m.Name)
+        for _, kw in ipairs({ "buffer", "zion" }) do
+            if string.find(lname, kw, 1, true) then W1("名字含作者名") break end
+        end
+        if S.playerNames[lname] then
+            W1("名字=在场玩家")
+        else
+            for nm in pairs(S.playerNames) do
+                if #nm >= 4 and string.sub(lname, -#nm) == nm then
+                    W1("名字以玩家名结尾"); break
+                end
+            end
+        end
+
+        if #strong > 0 then return 2, table.concat(strong, " · ") end
+        if #weak > 0 then return 1, table.concat(weak, " · ") end
+        return 0, ""
+    end
+
+    local function colorOf(tier)
+        if tier == 2 then return CFG.SpecialColor end
+        if tier == 1 then return CFG.AbnormalColor end
+        return CFG.NormalColor
+    end
+
+    local function makeEntry(m, tier, reason)
+        local c = colorOf(tier)
+        local hl = Instance.new("Highlight")
+        hl.Name = "StaffESP_HL"
+        hl.Adornee = m
+        hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        hl.FillColor = c
+        hl.FillTransparency = CFG.FillAlpha
+        hl.OutlineColor = c
+        hl.OutlineTransparency = 0
+        pcall(function() hl.Parent = m end)
+
+        if not headOf(m) then
+            return { hl = hl, gui = nil, label = nil, tier = tier, reason = reason }
+        end
+
+        local bb = Instance.new("BillboardGui")
+        bb.Name = "StaffESP_Tag"
+        bb.Adornee = m
+        bb.Size = UDim2.new(0, 240, 0, 44)
+        bb.StudsOffset = Vector3.new(0, 3.2, 0)
+        bb.AlwaysOnTop = true
+        bb.MaxDistance = CFG.MaxDistance
+        bb.LightInfluence = 0
+        pcall(function() bb.Parent = m end)
+
+        local txt = Instance.new("TextLabel")
+        txt.Size = UDim2.new(1, 0, 1, 0)
+        txt.BackgroundTransparency = 1
+        txt.Font = Enum.Font.GothamBold
+        txt.TextSize = 14
+        txt.TextStrokeTransparency = 0
+        txt.TextColor3 = c
+        txt.Text = ""
+        txt.Parent = bb
+
+        return { hl = hl, gui = bb, label = txt, tier = tier, reason = reason }
+    end
+
+    local function destroyEntry(m)
+        local e = S.derived[m]
+        if not e then return end
+        if e.hl and e.hl.Parent then pcall(function() e.hl:Destroy() end) end
+        if e.gui and e.gui.Parent then pcall(function() e.gui:Destroy() end) end
+        S.derived[m] = nil
+    end
+
+    local function setStatus(t)
+        S.status = t
+        if S.label then S.label.Text = t end
+    end
+
+    local function groundY(p)
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        local ch = LP2.Character
+        params.FilterDescendantsInstances = ch and { ch } or {}
+        local hit = WSS:Raycast(p + Vector3.new(0, 40, 0), Vector3.new(0, -140, 0), params)
+        return hit and hit.Position.Y or p.Y
+    end
+
+    local function tpTo(m)
+        local ch = LP2.Character
+        local root = myRoot()
+        local head = headOf(m)
+        if not (ch and root and head) then return false, "缺少角色/目标坐标" end
+        local tPos = head.Position
+        local dir = root.Position - tPos
+        dir = Vector3.new(dir.X, 0, dir.Z)
+        if dir.Magnitude < 0.5 then dir = Vector3.new(0, 0, 1) end
+        local dest = tPos + dir.Unit * CFG.SafeDist
+        dest = Vector3.new(dest.X, groundY(dest) + 3, dest.Z)
+        local ok = pcall(function()
+            ch:PivotTo(CFrame.lookAt(dest, Vector3.new(tPos.X, dest.Y + 1, tPos.Z)))
+        end)
+        if not ok then return false, "PivotTo 失败（角色可能已消失）" end
+        return true
+    end
+
+    local function watch(m, seconds)
+        if not CFG.AutoWatch then return end
+        local head = headOf(m)
+        local cam = WSS.CurrentCamera
+        if not (head and cam) then return end
+        if S.watchConn then S.watchConn:Disconnect() S.watchConn = nil end
+        local stopAt = os.clock() + (seconds or CFG.WatchSeconds)
+        S.watchConn = RunService.RenderStepped:Connect(function()
+            if not S.on or os.clock() > stopAt or not head.Parent then
+                if S.watchConn then S.watchConn:Disconnect() S.watchConn = nil end
+                return
+            end
+            pcall(function() cam.CFrame = CFrame.lookAt(cam.CFrame.Position, head.Position) end)
+        end)
+    end
+
+    local function canTP()
+        if not CFG.AutoTP then return false, "自动传送已关闭" end
+        if LP2:GetAttribute("InRound") ~= true then return false, "不在回合中" end
+        if LP2:GetAttribute("Role") == "SCP" then return false, "本局你是 SCP" end
+        if LP2:GetAttribute("Ghost") == true then return false, "当前是鬼魂/旁观" end
+        local ch = LP2.Character
+        local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+        if not (ch and hum and hum.Health > 0) then return false, "角色未存活" end
+        return true
+    end
+
+    local function pickTarget()
+        local root = myRoot()
+        if not root then return nil end
+        local myPos = root.Position
+        local best, bestD = nil, math.huge
+        for m, e in pairs(S.derived) do
+            if e.tier == 2 and m.Parent then
+                local hum = m:FindFirstChildOfClass("Humanoid")
+                if (hum == nil) or hum.Health > 0 then
+                    local head = headOf(m)
+                    local p = head and head.Position or m:GetPivot().Position
+                    local d = (p - myPos).Magnitude
+                    if d < bestD then best, bestD = m, d end
+                end
+            end
+        end
+        return best, bestD
+    end
+
+    local function buildPool()
+        local pool, seen = {}, {}
+        local function push(m)
+            if m and not seen[m] then seen[m] = true; pool[#pool + 1] = m end
+        end
+        for _, m in ipairs(CollectionService:GetTagged("StaffNPC")) do push(m) end
+        local folder = WSS:FindFirstChild("Staff")
+        if folder then
+            for _, m in ipairs(folder:GetChildren()) do
+                if m:IsA("Model") then push(m) end
+            end
+        end
+        local isPlayerChar = {}
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p.Character then isPlayerChar[p.Character] = true end
+        end
+        for _, m in ipairs(WSS:GetChildren()) do
+            if m:IsA("Model") and not isPlayerChar[m] and m:FindFirstChildOfClass("Humanoid") then
+                local role = m:GetAttribute("StaffRole")
+                local staff = m:GetAttribute("Staff") == true
+                local lname = string.lower(m.Name)
+                local hitKw = false
+                for _, kw in ipairs(KEYWORDS) do
+                    if string.find(lname, kw, 1, true) then hitKw = true break end
+                end
+                if staff or role ~= nil or hitKw or S.playerNames[lname] then push(m) end
+            end
+        end
+        return pool
+    end
+
+    local function scan()
+        local pool = buildPool()
+        local alive = {}
+        local sp, ab, no = 0, 0, 0
+        for _, m in ipairs(pool) do
+            if m:IsA("Model") and m.Parent then
+                alive[m] = true
+                local hum = m:FindFirstChildOfClass("Humanoid")
+                local dead = (hum and hum.Health <= 0) or m:GetAttribute("Ragdolled") == true
+                local tier, reason = classify(m)
+                if tier == 2 then sp = sp + 1
+                elseif tier == 1 then ab = ab + 1
+                else no = no + 1 end
+
+                local e = S.derived[m]
+                if not e then
+                    if not (tier == 0 and not CFG.ShowNormal) then
+                        e = makeEntry(m, tier, reason)
+                        S.derived[m] = e
+                        if tier == 2 and CFG.NotifyNew and not S.known[m] then
+                            S.known[m] = true
+                            print(string.format("[STAFF] ★特殊研究员：%s | %s | %s",
+                                m:GetFullName(), reason, table.concat(attrsOf(m), ", ")))
+                            pcall(function()
+                                StarterGui:SetCore("SendNotification", {
+                                    Title = "★ 特殊研究员",
+                                    Text = m.Name .. "  " .. reason,
+                                    Duration = 6,
+                                })
+                            end)
+                        end
+                    end
+                elseif dead then
+                    if e.hl then e.hl.FillTransparency = 0.95 end
+                    if e.label then e.label.Text = "☠ " .. m.Name end
+                end
+            end
+        end
+        for m in pairs(S.derived) do
+            if not alive[m] then
+                if m == S.target then S.target = nil end
+                destroyEntry(m)
+            end
+        end
+        -- 特殊 NPC 出现时单独提示（手机端无键盘，靠通知）
+        if sp > 0 and S._lastSp ~= sp then
+            S._lastSp = sp
+            pcall(function()
+                StarterGui:SetCore("SendNotification", {
+                    Title = "★ 特殊研究员在场", Text = sp .. " 个（可拿隐藏徽章）", Duration = 5,
+                })
+            end)
+        elseif sp == 0 then
+            S._lastSp = 0
+        end
+    end
+
+    local function pursue()
+        if not CFG.AutoTP then return end
+        if not canTP() then return end
+        local target, dist = pickTarget()
+        if not target then S.target = nil return end
+        if S.target ~= target then
+            S.target = target; S.tpCount = 0; S.nextTP = 0
+        end
+        local now = os.clock()
+        if dist <= CFG.FirstTPDist then return end
+        if now < S.nextTP then return end
+        if S.tpCount >= CFG.MaxTPPerTarget then return end
+        local done, err = tpTo(target)
+        S.tpCount = S.tpCount + 1
+        S.nextTP = now + CFG.TeleportCD
+        if done then
+            S.tpTotal = S.tpTotal + 1
+            S.lastTP = string.format("已传送 %s（%d→%d格·第%d次）",
+                target.Name, math.floor(dist), CFG.SafeDist, S.tpCount)
+            watch(target, CFG.WatchSeconds)
+        else
+            S.lastTP = "传送失败：" .. tostring(err)
+        end
+    end
+
+    local function refreshTexts()
+        local root = myRoot()
+        if not root then return end
+        local myPos = root.Position
+        for m, e in pairs(S.derived) do
+            if e.label and m.Parent then
+                local head = headOf(m)
+                local p = head and head.Position or m:GetPivot().Position
+                local d = (p - myPos).Magnitude
+                local tag = (e.tier == 2 and "★ SPECIAL")
+                    or (e.tier == 1 and "? ABNORMAL") or m.Name
+                local extra = (e.tier ~= 0) and ("\n" .. e.reason) or ""
+                e.label.Text = string.format("%s  [%d]", tag, math.floor(d)) .. extra
+            end
+        end
+    end
+
+    local function dump()
+        local pool = buildPool()
+        local lines = { "[STAFF] v1.4 观察池=" .. #pool }
+        local oa = 0 for _ in pairs(S.ownerAssets) do oa = oa + 1 end
+        local pa = 0 for _ in pairs(S.playerAssets) do pa = pa + 1 end
+        lines[#lines + 1] = string.format("作者资产=%d 玩家缓存=%d 最近=%s 特殊累计=%d",
+            oa, pa, S.lastTP, S.tpTotal)
+        for _, m in ipairs(pool) do
+            local hum = m:FindFirstChildOfClass("Humanoid")
+            local tier, reason = classify(m)
+            local _, ids = assetsOf(m)
+            lines[#lines + 1] = string.format("%s | tier=%d | 资产=[%s] | %s | %s",
+                m:GetFullName(), tier, table.concat(ids, ","), reason,
+                table.concat(attrsOf(m), ", "))
+        end
+        local text = table.concat(lines, "\n")
+        print(text)
+        return text
+    end
+
+    local function tpNow()
+        local target, dist = pickTarget()
+        if not target then return false, "场上没有 ★ 特殊研究员" end
+        local done, err = tpTo(target)
+        if done then
+            S.target = target
+            S.tpTotal = S.tpTotal + 1
+            S.lastTP = string.format("手动传送 %s（%d→%d格）", target.Name, math.floor(dist or 0), CFG.SafeDist)
+            watch(target, CFG.WatchSeconds)
+            return true, S.lastTP
+        end
+        return false, err
+    end
+
+    local function start()
+        if S.conn then return end
+        S.on = true
+        refreshAssets()
+        S.conn = RunService.Heartbeat:Connect(function()
+            if not S.on then return end
+            local now = os.clock()
+            local ok, err = pcall(function()
+                if now - S.assetAt > 30 then refreshAssets() end
+                if now - S.scanAt >= CFG.ScanInterval then
+                    S.scanAt = now
+                    scan()
+                    pursue()
+                end
+                refreshTexts()
+            end)
+            if not ok then setStatus("透视出错：" .. tostring(err)) end
+        end)
+    end
+
+    local function stop()
+        S.on = false
+        if S.conn then S.conn:Disconnect() S.conn = nil end
+        if S.watchConn then S.watchConn:Disconnect() S.watchConn = nil end
+        for m in pairs(S.derived) do destroyEntry(m) end
+        S.target = nil
+    end
+
+    -- 键盘快捷键（PC 端可选；手机端用 API/通知）
+    table.insert(S.Conns, UserInputService.InputBegan:Connect(function(input, processed)
+        if processed then return end
+        if input.KeyCode == CFG.ToggleKey then
+            if S.on then stop() else start() end
+        elseif input.KeyCode == CFG.TPKey then
+            tpNow()
+        end
+    end))
+
+    local API = {
+        Start = start, Stop = stop, Dump = dump, TPNow = tpNow,
+        State = S, CFG = CFG,
+        SetEnabled = function(v)
+            v = v and true or false
+            if v then start() else stop() end
+            CFG.Enabled = v
+            return v
+        end,
+        SetTP = function(v) CFG.AutoTP = v and true or false; return CFG.AutoTP end,
+        SetWatch = function(v) CFG.AutoWatch = v and true or false; return CFG.AutoWatch end,
+        SetNormal = function(v)
+            CFG.ShowNormal = v and true or false
+            for m in pairs(S.derived) do destroyEntry(m) end
+            S.known = {}
+            return CFG.ShowNormal
+        end,
+    }
+    Gg.STAFF_ESP = API
+    _G.StaffESP = API
+
+    -- 联动主界面「SCP透视」总开关
+    local lastMaster2 = nil
+    table.insert(S.Conns, RunService.Heartbeat:Connect(function()
+        local E = Gg.CRATE_ESP
+        if not E then return end
+        local cur = E.SCPEnabled ~= false
+        if lastMaster2 == nil then lastMaster2 = cur end
+        if cur ~= lastMaster2 then
+            lastMaster2 = cur
+            pcall(function() API.SetEnabled(cur) end)
+        end
+    end))
+    do
+        local E = Gg.CRATE_ESP
+        local cur = (E == nil) or (E.SCPEnabled ~= false)
+        lastMaster2 = cur
+        if cur then start() end
+    end
+
+    print("[ESP] 特殊研究员透视 已内嵌装载 · " .. tostring(CFG.Enabled))
 end
