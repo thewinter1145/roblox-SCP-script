@@ -6655,6 +6655,24 @@ local function buildObsidianUI(Library)
     addToggle("Gun", "武器透视")
     addToggle("Crate", "物资箱透视")
 
+    -- 子项：透视同样受「SCP透视」总开关约束
+    GB:AddToggle("espStaff", {
+        Text = "徽章NPC透视", Default = true,
+        Tooltip = "跟随 SCP透视 总开关；这里只关这一层",
+        Callback = function(v)
+            if G.STAFF_ESP then G.STAFF_ESP.SetUserEnabled(v) end
+            Library:Notify("徽章NPC透视 " .. (v and "已开启" or "已关闭"), 2)
+        end,
+    })
+    GB:AddToggle("esp610anti", {
+        Text = "610防护（防感染）", Default = true,
+        Tooltip = "清零 SCP610Infection / 摘除自身感染标签",
+        Callback = function(v)
+            if G.SCP610_DEF then G.SCP610_DEF.SetAnti(v) end
+            Library:Notify("610防护 " .. (v and "已开启" or "已关闭"), 2)
+        end,
+    })
+
     local GB2 = TabMain:AddLeftGroupbox("说明", "info")
     GB2:AddLabel("SCP 统一红色 · 人类统一绿色")
     GB2:AddLabel("判定沿用原始脚本的队伍/属性逻辑")
@@ -7410,11 +7428,16 @@ local function buildNativeUI(pg)
         end
         refresh()
         btn.MouseButton1Click:Connect(function()
-            state = not state
+            state = not (getv() and true or false)   -- 以真实状态取反，避免显示与实际脱节
             setv(state)
             if G.CRATE_ESP then G.CRATE_ESP.Reconcile() end
             refresh()
         end)
+        -- 允许外部（总开关联动）把按钮显示拉回真实状态
+        row.Sync = function()
+            state = getv() and true or false
+            refresh()
+        end
         return row
     end
 
@@ -7564,6 +7587,35 @@ local function buildNativeUI(pg)
     y = y + 36
     makeButton(y, "还原原速并停用", pageMain, Color3.fromRGB(120, 80, 45), function()
         if G.SPEED and G.SPEED.Off then G.SPEED.Off() end
+    end)
+
+    -- ===== SCP 透视子项（透视统一跟随主「SCP透视」总开关）=====
+    makeHint(496, "─ SCP子项（跟随主「SCP透视」总开关）─", pageMain, 11, Color3.fromRGB(120, 210, 255))
+    local rowStaff = makeToggle(514, "徽章NPC透视",
+        function() return G.STAFF_ESP and G.STAFF_ESP.CFG.UserEnabled or false end,
+        function(v) if G.STAFF_ESP then G.STAFF_ESP.SetUserEnabled(v) end end,
+        pageMain)
+    local row610 = makeToggle(550, "610 防护（防感染）",
+        function() return G.SCP610_DEF and G.SCP610_DEF.AntiInfect or false end,
+        function(v) if G.SCP610_DEF then G.SCP610_DEF.SetAnti(v) end end,
+        pageMain)
+
+    local espSubSt = makeHint(586, "状态：等待模块…", pageMain, 10, Color3.fromRGB(160, 200, 230))
+    task.spawn(function()
+        while gui.Parent do
+            pcall(function()
+                local SE, SD = G.STAFF_ESP, G.SCP610_DEF
+                local on = G.CRATE_ESP and G.CRATE_ESP.SCPEnabled
+                espSubSt.Text = string.format("总开关:%s · 徽章:%s · 610:%s",
+                    on and "开" or "关",
+                    SE and (SE.CFG.Enabled and "显示" or "停") or "-",
+                    SD and (SD.AntiInfect and "防护开" or "防护关") or "-")
+                -- 总开关变化时把按钮显示拉回真实状态
+                if rowStaff.Sync then rowStaff.Sync() end
+                if row610.Sync then row610.Sync() end
+            end)
+            task.wait(0.5)
+        end
     end)
 
     -- ============ 页2：防护 ============
@@ -8846,6 +8898,7 @@ do
     local CFG = {
         ScanInterval  = 0.5,
         Enabled       = true,
+        UserEnabled   = true,            -- 玩家自己这个开关；实际显示 = 本开关 AND 主「SCP透视」
         ShowNormal    = false,           -- 默认只显示 ★特殊 / ?可疑，屏幕更干净
         SpecialColor  = Color3.fromRGB(255, 55, 55),
         AbnormalColor = Color3.fromRGB(255, 150, 40),
@@ -9276,7 +9329,8 @@ do
 
     local function dump()
         local pool = buildPool()
-        local lines = { "[STAFF] v1.4 观察池=" .. #pool }
+        local lines = { string.format("[STAFF] v1.4 观察池=%d · 用户开关=%s · 生效=%s",
+            #pool, tostring(CFG.UserEnabled), tostring(CFG.Enabled)) }
         local oa = 0 for _ in pairs(S.ownerAssets) do oa = oa + 1 end
         local pa = 0 for _ in pairs(S.playerAssets) do pa = pa + 1 end
         lines[#lines + 1] = string.format("作者资产=%d 玩家缓存=%d 最近=%s 特殊累计=%d",
@@ -9340,20 +9394,43 @@ do
     table.insert(S.Conns, UserInputService.InputBegan:Connect(function(input, processed)
         if processed then return end
         if input.KeyCode == CFG.ToggleKey then
-            if S.on then stop() else start() end
+            -- 热键也只切用户层，仍受主「SCP透视」总开关约束
+            CFG.UserEnabled = not CFG.UserEnabled
+            local E = Gg.CRATE_ESP
+            local master = (E == nil) or (E.SCPEnabled ~= false)
+            if CFG.UserEnabled and master then start() else stop() end
         elseif input.KeyCode == CFG.TPKey then
             tpNow()
         end
     end))
 
+    -- 有效状态 = 用户开关 AND 主界面「SCP透视」总开关
+    local function masterOn()
+        local E = Gg.CRATE_ESP
+        return (E == nil) or (E.SCPEnabled ~= false)
+    end
+    local function syncEnabled()
+        local want = CFG.UserEnabled and masterOn()
+        CFG.Enabled = want
+        if want then
+            if not S.on then start() end
+        else
+            if S.on then stop() end
+        end
+        return want
+    end
+
     local API = {
         Start = start, Stop = stop, Dump = dump, TPNow = tpNow,
-        State = S, CFG = CFG,
+        State = S, CFG = CFG, Sync = syncEnabled,
+        -- 用户开关：只关自己这一层，不影响总开关
         SetEnabled = function(v)
-            v = v and true or false
-            if v then start() else stop() end
-            CFG.Enabled = v
-            return v
+            CFG.UserEnabled = v and true or false
+            return syncEnabled()
+        end,
+        SetUserEnabled = function(v)
+            CFG.UserEnabled = v and true or false
+            return syncEnabled()
         end,
         SetTP = function(v) CFG.AutoTP = v and true or false; return CFG.AutoTP end,
         SetWatch = function(v) CFG.AutoWatch = v and true or false; return CFG.AutoWatch end,
@@ -9367,23 +9444,19 @@ do
     Gg.STAFF_ESP = API
     _G.StaffESP = API
 
-    -- 联动主界面「SCP透视」总开关
+    -- 联动主界面「SCP透视」总开关（总开关变化时重算有效状态）
     local lastMaster2 = nil
     table.insert(S.Conns, RunService.Heartbeat:Connect(function()
-        local E = Gg.CRATE_ESP
-        if not E then return end
-        local cur = E.SCPEnabled ~= false
+        local cur = masterOn()
         if lastMaster2 == nil then lastMaster2 = cur end
         if cur ~= lastMaster2 then
             lastMaster2 = cur
-            pcall(function() API.SetEnabled(cur) end)
+            pcall(syncEnabled)
         end
     end))
     do
-        local E = Gg.CRATE_ESP
-        local cur = (E == nil) or (E.SCPEnabled ~= false)
-        lastMaster2 = cur
-        if cur then start() end
+        lastMaster2 = masterOn()
+        syncEnabled()
     end
 
     print("[ESP] 特殊研究员透视 已内嵌装载 · " .. tostring(CFG.Enabled))
