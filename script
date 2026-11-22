@@ -116,6 +116,62 @@ local GREEN = Color3.fromRGB(70, 225, 120)  -- 人类统一绿
 local GUNC  = Color3.fromRGB(95, 210, 255)
 local CRATEC = Color3.fromRGB(70, 225, 120)
 
+-- ===== 暴乱模式 GuardsVsPlayers 队伍工具（供 ESP 颜色 + GUNBOT 过滤复用）=====
+local RBLUE   = Color3.fromRGB(70, 150, 255)   -- Guard 系 = 蓝
+local RYELLOW = Color3.fromRGB(255, 205, 50)   -- ClassD   = 黄
+local function isRiotMode()
+    local ok, v = pcall(function() return game:GetService("ReplicatedStorage"):GetAttribute("RoundMode") end)
+    return ok and v == "GuardsVsPlayers"
+end
+-- 职业 -> 队伍："G"=Guard系, "D"=ClassD, nil=中立
+local function teamOfClass(class)
+    local c = tostring(class or ""):lower():gsub("[-_%s]", "")
+    if c == "classd" or c == "dclass" or c == "d" then return "D" end
+    if c == "guard" or c == "facilityguard" or c == "responsespecialist"
+       or c == "containmentspecialist" or c == "security" or c == "mtf"
+       or c == "scientist" or c == "janitor" or c == "researcher" then return "G" end
+    return nil
+end
+-- 从玩家对象取队伍（角色 Class 属性优先，回退 Player 属性）
+local function teamOfPlayer(pl)
+    if not pl then return nil end
+    local cls
+    pcall(function()
+        local ch = pl.Character
+        cls = (ch and ch:GetAttribute("Class")) or pl:GetAttribute("Class") or pl:GetAttribute("ActiveClass")
+    end)
+    return teamOfClass(cls)
+end
+-- 旁观者判定（多判据 OR，任一命中即旁观）
+-- 供 ESP 与 GUNBOT/autoskill 共用，避免把幽灵当成有效玩家透视或攻击
+-- 本游戏旁观状态是瞬时/回合相关的：Player.Ghost 属性为权威标志，
+-- 但角色 Ghost 标签/Class 清空存在时机差，故必须多判据合并，避免漏判把幽灵当敌对。
+local CS_SPEC = game:GetService("CollectionService")
+local function isGhostSpec(pl)
+    if not pl then return false end
+    -- ① 玩家权威属性（游戏自身在 5170/6138 行用的判据）
+    local okA, g = pcall(function() return pl:GetAttribute("Ghost") end)
+    if okA and g == true then return true end
+    local ok, ch = pcall(function() return pl:IsA("Player") and pl.Character or pl end)
+    if not ok or not ch then return false end
+    -- ② 角色属性
+    local okB, g2 = pcall(function() return ch:GetAttribute("Ghost") end)
+    if okB and g2 == true then return true end
+    -- ③ CollectionService 标签
+    local ok2, tagged = pcall(function() return CS_SPEC:HasTag(ch, "Ghost") end)
+    if ok2 and tagged == true then return true end
+    -- ④ Humanoid 状态 / 不在工作区（观战容器、Lobby、死亡）
+    local okH, hum = pcall(function() return ch:FindFirstChildOfClass("Humanoid") end)
+    if okH and hum then
+        local okS, st = pcall(function() return hum:GetState() end)
+        if okS and (st == Enum.HumanoidStateType.Dead
+                 or st == Enum.HumanoidStateType.Spectating) then return true end
+    end
+    local okP, par = pcall(function() return ch.Parent end)
+    if okP and par ~= workspace then return true end
+    return false
+end
+
 -- 字体：优先最粗的 GothamBlack（加黑加粗），环境不支持则回退 GothamBold
 local HEAVY = Enum.Font.GothamBold
 pcall(function() HEAVY = Enum.Font.GothamBlack end)
@@ -1842,6 +1898,241 @@ do
     end
 end
 
+-- ============================================================
+-- SCP-294 饮料效果显示（防护栏开关项）· 拿起杯子显示效果
+-- 机制：杯子是带 SCP294Cup 标签的 Tool，DrinkId 属性(=饮料表键，如 EnergyDrink)
+--   才是查表 Id；DrinkToken 是服务器验证 UUID 不用于查表。查到官方 Name/Notice/Effect 显示。
+-- 安全：只在 CoreGui 建显示 UI，不碰 PlayerGui/触摸层/相机；不 hook 任何
+--   Remote；纯事件驱动、零全树扫描。缝合版默认开启，防护栏可关。
+-- 对外：G.SCP294_DRINK.{SetEnabled, SetTime, List, Dump, Off, On, Enabled}
+-- ============================================================
+do
+    if G.SCP294_DRINK and G.SCP294_DRINK.Off then pcall(function() G.SCP294_DRINK.Off() end) end
+    G.SCP294_DRINK = nil
+
+    local RS      = game:GetService("ReplicatedStorage")
+    local CS      = game:GetService("CollectionService")
+    local Players = game:GetService("Players")
+    local LP      = Players.LocalPlayer
+
+    local D = {
+        Enabled = true, ShowTime = 6, TokenAttr = "DrinkToken", CupTag = "SCP294Cup",
+        Shown = 0, Last = "无", Status = "运行中",
+        gui = nil, conns = {}, hideAt = 0,
+    }
+    G.SCP294_DRINK = D
+
+    local T = nil
+    pcall(function() T = require(RS.SharedModules.SCP294Drinks) end)
+
+    local function effectText(drink)
+        local notice = tostring(drink.Notice or "")
+        local eff = (type(drink.Effect) == "table") and drink.Effect or {}
+        local n = nil
+        for _, k in ipairs({ "Heal", "Damage", "FullHeal" }) do
+            if type(eff[k]) == "number" then n = eff[k]; break end
+        end
+        if n then notice = string.gsub(notice, "%%d", tostring(math.floor(n))) end
+        local CN = {
+            Heal="回血", FullHeal="回满血", Damage="扣血", Speed="加速", Slow="减速",
+            Freeze="定身", Meter="感染度变化", Escape="逃脱指引", Stamina="回体力",
+            Regen="持续回血", NoBlink="防眨眼", Light="发光", Silence="静步",
+            Dot="持续掉血", Crash="高速后副作用", Knockdown="击倒", Emote="趣味动作",
+        }
+        local parts = {}
+        for k, _ in pairs(eff) do if CN[k] then parts[#parts+1] = CN[k] end end
+        table.sort(parts)
+        if type(drink.Screen) == "table" and drink.Screen[1] then parts[#parts+1] = "视觉:"..tostring(drink.Screen[1]) end
+        if type(drink.Look) == "table" and drink.Look[1] then parts[#parts+1] = "外观:"..tostring(drink.Look[1]) end
+        local hasNotice = notice ~= "" and notice ~= "???" and notice ~= "nil"
+        local extra = #parts > 0 and table.concat(parts, "/") or ""
+        if hasNotice then
+            return notice .. (#parts > 0 and ("  [" .. extra .. "]") or "")
+        end
+        -- 无文案：用中文/视觉注解作为主说明；都没有则给通用提示
+        return extra ~= "" and extra or "特殊效果（游戏内生效）"
+    end
+
+    local function lookup(token)
+        if not T or type(T.ById) ~= "table" or not token then return nil end
+        local d = T.ById[token]
+        if d then return d, token end
+        local lt = string.lower(tostring(token))
+        for id, v in pairs(T.ById) do
+            if string.lower(tostring(id)) == lt then return v, id end
+        end
+        return nil
+    end
+
+    local function buildGUI()
+        if D.gui then return end
+        local ok = pcall(function()
+            local sg = Instance.new("ScreenGui")
+            sg.Name = "SCP294DrinkHUD"
+            sg.ResetOnSpawn = false
+            sg.IgnoreGuiInset = true
+            sg.DisplayOrder = 50
+            sg.Parent = game:GetService("CoreGui")
+            local box = Instance.new("Frame")
+            box.Size = UDim2.new(0, 460, 0, 74)
+            box.Position = UDim2.new(0.5, -230, 0, 120)
+            box.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
+            box.BackgroundTransparency = 0.25
+            box.BorderSizePixel = 0
+            box.Parent = sg
+            local title = Instance.new("TextLabel")
+            title.Name = "Title"
+            title.Size = UDim2.new(1, 0, 0, 30)
+            title.Position = UDim2.new(0, 0, 0, 6)
+            title.BackgroundTransparency = 1
+            title.Font = Enum.Font.GothamBold
+            title.TextSize = 20
+            title.TextColor3 = Color3.fromRGB(120, 220, 255)
+            title.TextStrokeTransparency = 0
+            title.TextStrokeColor3 = Color3.new(0,0,0)
+            title.Parent = box
+            local desc = Instance.new("TextLabel")
+            desc.Name = "Desc"
+            desc.Size = UDim2.new(1, 0, 0, 32)
+            desc.Position = UDim2.new(0, 0, 0, 36)
+            desc.BackgroundTransparency = 1
+            desc.Font = Enum.Font.Gotham
+            desc.TextSize = 16
+            desc.TextColor3 = Color3.fromRGB(255, 235, 150)
+            desc.TextStrokeTransparency = 0
+            desc.TextStrokeColor3 = Color3.new(0,0,0)
+            desc.TextWrapped = true
+            desc.Parent = box
+            box.Visible = false
+            D.gui = sg; D.box = box; D.title = title; D.desc = desc
+        end)
+        if not ok then D.Status = "GUI 创建失败" end
+    end
+
+    local function show(drink, id)
+        if not D.Enabled then return end
+        buildGUI()
+        if not D.gui then return end
+        local txt = effectText(drink)
+        local name = tostring(drink.Name or id)
+        local kind = string.lower(tostring(drink.Kind or ""))
+        local col = kind == "dangerous" and Color3.fromRGB(255, 90, 90)
+            or Color3.fromRGB(120, 220, 255)
+        pcall(function()
+            D.title.Text = "🥤 " .. name .. (kind == "dangerous" and "  ⚠危险" or "")
+            D.title.TextColor3 = col
+            D.desc.Text = "效果：" .. txt
+            if type(drink.Color) == "userdata" then D.box.BackgroundColor3 = drink.Color end
+            D.box.Visible = true
+        end)
+        D.Last = name .. " → " .. txt
+        D.Shown = D.Shown + 1
+        D.hideAt = os.clock() + D.ShowTime
+    end
+
+    local function checkCup(tool)
+        if not tool or tool.ClassName ~= "Tool" then return end
+        local okTag = pcall(function() return CS:HasTag(tool, D.CupTag) end)
+        if not okTag or not CS:HasTag(tool, D.CupTag) then return end
+        -- 真实杯子：DrinkId=饮料表键(如 EnergyDrink)，DrinkToken=服务器验证 UUID(不查表)
+        -- 优先 DrinkId，其次 DrinkToken，都没有才显示未知
+        local id1, id2 = nil, nil
+        pcall(function() id1 = tool:GetAttribute("DrinkId") end)
+        pcall(function() id2 = tool:GetAttribute(D.TokenAttr) end)
+        local drink, id = lookup(id1)
+        if not drink then drink, id = lookup(id2) end
+        if drink then
+            show(drink, id)
+        else
+            buildGUI()
+            if D.gui then pcall(function()
+                D.title.Text = "🥤 饮料（未知）"
+                D.desc.Text = "DrinkId=" .. tostring(id1) .. " Token=" .. tostring(id2) .. "（表中未找到）"
+                D.box.Visible = true
+            end) end
+            D.Last = "未知 id=" .. tostring(id1) .. " token=" .. tostring(id2)
+            D.hideAt = os.clock() + D.ShowTime
+        end
+    end
+
+    local function watchChar(ch)
+        if not ch then return end
+        pcall(function()
+            table.insert(D.conns, ch.ChildAdded:Connect(function(tool) task.defer(checkCup, tool) end))
+        end)
+    end
+
+    local function startWatching()
+        if LP then
+            table.insert(D.conns, LP.CharacterAdded:Connect(watchChar))
+            if LP.Character then watchChar(LP.Character) end
+            pcall(function()
+                local bg = LP:FindFirstChildOfClass("Backpack")
+                if bg then table.insert(D.conns, bg.ChildAdded:Connect(function(tool) task.defer(checkCup, tool) end)) end
+                table.insert(D.conns, LP.ChildAdded:Connect(function(o)
+                    if o:IsA("Backpack") then table.insert(D.conns, o.ChildAdded:Connect(function(tool) task.defer(checkCup, tool) end)) end
+                end))
+                if LP.Character then
+                    for _, tool in ipairs(LP.Character:GetChildren()) do checkCup(tool) end
+                end
+            end)
+        end
+        table.insert(D.conns, game:GetService("RunService").Heartbeat:Connect(function()
+            if D.gui and D.box and D.box.Visible and os.clock() >= D.hideAt then
+                pcall(function() D.box.Visible = false end)
+            end
+        end))
+    end
+    startWatching()
+
+    D.SetEnabled = function(v)
+        if v then
+            if D.Enabled then return true end
+            D.Enabled = true
+            D.Status = "运行中"
+            startWatching()
+        else
+            D.Enabled = false
+            for _, c in ipairs(D.conns) do pcall(function() c:Disconnect() end) end
+            D.conns = {}
+            if D.gui and D.box then pcall(function() D.box.Visible = false end) end
+            D.Status = "已关闭"
+        end
+        return D.Enabled
+    end
+    D.Off = function()
+        D.Enabled = false
+        for _, c in ipairs(D.conns) do pcall(function() c:Disconnect() end) end
+        D.conns = {}
+        if D.gui then pcall(function() D.gui:Destroy() end) end
+        D.gui, D.box = nil, nil
+        D.Status = "已关闭"
+    end
+    D.On = function()
+        if D.gui then pcall(function() D.gui:Destroy() end) end
+        D.gui, D.box = nil, nil
+        for _, c in ipairs(D.conns) do pcall(function() c:Disconnect() end) end
+        D.conns = {}
+        D.Enabled = true
+        D.Status = "运行中"
+        startWatching()
+    end
+    D.SetTime = function(s) if type(s)=="number" and s>0 then D.ShowTime=s end return D.ShowTime end
+    D.List = function()
+        local out = {}
+        if type(T)=="table" and type(T.ById)=="table" then
+            for id, d in pairs(T.ById) do out[#out+1] = id .. " (" .. tostring(d.Name) .. ")" end
+        end
+        table.sort(out)
+        return table.concat(out, ", ")
+    end
+    D.Dump = function()
+        return string.format("SCP294_DRINK Enabled=%s Table=%s Shown=%d Last=%s",
+            tostring(D.Enabled), tostring(type(T)=="table"), D.Shown, D.Last)
+    end
+    print("[ESP] SCP294 饮料效果显示已装载（防护栏可开关）")
+end
+
 local SCP_NUMS = { "682", "173", "096", "049", "106", "035", "777", "939", "999" }
 local function compact(s)
     return string.gsub(string.lower(tostring(s or "")), "[-_%s]", "")
@@ -2089,6 +2380,8 @@ do
     -- 旁观者判定：队伍 / 玩家属性 / 角色所在容器
     local function isSpectator(pl, ch)
         if not pl then return false end
+        -- 本游戏旁观者：角色带 "Ghost" 标签（Class=nil）→ 直接判定为旁观者
+        if isGhostSpec(pl) then return true end
         local okT, team = pcall(function() return pl.Team end)
         if okT and team then
             local n = string.lower(tostring(team.Name))
@@ -2398,6 +2691,15 @@ do
 
         local txt = rec.label or "?"
         local col = colorFor(rec.kind, rec.label)
+        -- 暴乱模式：玩家按队伍上色（Guard系蓝 / ClassD黄），中立不变
+        if isRiotMode() then
+            local tp = rec.player or (rec.model and PlayersSvc:GetPlayerFromCharacter(rec.model))
+            if tp then
+                local tm = teamOfPlayer(tp)
+                if tm == "G" then col = RBLUE
+                elseif tm == "D" then col = RYELLOW end
+            end
+        end
         -- 真人操控的 SCP：SCP-编号 + 真实操控者用户名
         -- 旧版把操控者名字写死成问号占位符 → 玩家看到一堆问号，编号也被吞掉。
         if rec.kind == "scp" and (rec.isPlayerSCP or m:GetAttribute("Controller") == "Player") then
@@ -2950,6 +3252,8 @@ do
     -- 过滤：类别 / 锁定 / 筛选 / 同队
     -- --------------------------------------------------------
     local function wanted(c)
+        -- 旁观者（Ghost 幽灵）永不攻击：_CLASS=nil，非有效目标
+        if c.player and isGhostSpec(c.player) then return false end
         if B.Mode == "玩家" and c.kind ~= "Player" then return false end
         if B.Mode == "SCP"  and c.kind ~= "SCP"  then return false end
 
@@ -2974,9 +3278,16 @@ do
         end
 
         if B.RespectTeam and c.player then
-            local okT, myTeam = pcall(function() return LP.Team end)
-            local okP, pTeam  = pcall(function() return c.player.Team end)
-            if okT and okP and myTeam and pTeam == myTeam then return false end
+            -- 暴乱模式：按职业队伍（Guard系 vs ClassD），只打对面，不打同队
+            if isRiotMode() then
+                local myT = teamOfPlayer(LP)
+                local pT  = teamOfPlayer(c.player)
+                if myT and pT and myT == pT then return false end  -- 同队跳过
+            else
+                local okT, myTeam = pcall(function() return LP.Team end)
+                local okP, pTeam  = pcall(function() return c.player.Team end)
+                if okT and okP and myTeam and pTeam == myTeam then return false end
+            end
         end
         return true
     end
@@ -3437,8 +3748,21 @@ do
     -- 范围内是否有别的玩家角色（返回目标名、距离）
     local function findTarget(myRoot, reach)
         local bestName, bestD = nil, reach
+        local myTeamRiot = isRiotMode() and teamOfPlayer(LP) or nil
         for _, p in ipairs(Players:GetPlayers()) do
+            -- 暴乱模式：跳过同队玩家
+            local skip = false
             if p ~= LP then
+                -- 旁观者（Ghost）永不作为技能目标
+                if isGhostSpec(p) then skip = true end
+                if myTeamRiot then
+                    local pT = teamOfPlayer(p)
+                    if pT and pT == myTeamRiot then skip = true end
+                end
+            else
+                skip = true
+            end
+            if not skip then
                 local ok, ch = pcall(function() return p.Character end)
                 if ok and ch then
                     local part = ch:FindFirstChild("HumanoidRootPart") or ch.PrimaryPart
@@ -4029,8 +4353,8 @@ do
         Enabled   = false,   -- 默认关闭
         ShowFloat = false,   -- 悬浮圆点开关默认隐藏（面板 toggle 开启）
         Interval  = 0.15,    -- 兼容旧接口
-        Cooldown  = 0.8,     -- 同一扇门触发冷却(秒)——比旧版更灵敏
-        RangePad  = 20,      -- 门前触发半径(m)：v16.8 从8提到20（真机16m仍可开门；服务器校验真实距离，远了无效无害）
+        Cooldown  = 0.4,     -- 同一扇门触发冷却(秒)：0.8→0.4，更快连续开门
+        RangePad  = 28,      -- 门前触发半径(m)：20→28（服务器校验真实距离，远了无效无害）
         Doors     = 0,       -- 当前缓存的开门按钮数
         Nearby    = 0,       -- 本轮在门前半径内的门数
         Fires     = 0,       -- 累计触发次数
@@ -4140,7 +4464,7 @@ do
         D.Doors = #list
     end
 
-    -- 每 4 帧的距离检测：只做轻量失效检查 + 距离计算（不再每轮重跑完整 isDoorOpenPP）
+    -- 每 2 帧的距离检测（原4帧）：只做轻量失效检查 + 距离计算（不再每轮重跑完整 isDoorOpenPP）
     local function scan()
         if not D.Enabled or not playable() then return end
         local hrp = getHRP()
@@ -4173,10 +4497,10 @@ do
         D._acc, D._cacheT = 0, os.clock()
         D.ScanConn = RUS.Heartbeat:Connect(function()
             D._acc = (D._acc or 0) + 1
-            if D._acc < 4 then return end   -- 每4帧测距（轻量，响应仍快）
+            if D._acc < 2 then return end   -- 每2帧测距（原4帧，响应更快）
             D._acc = 0
             local t = os.clock()
-            if t - (D._cacheT or 0) >= 6 then  -- 静态门：6秒才全量遍历一次（大幅降卡顿）
+            if t - (D._cacheT or 0) >= 2 then  -- 缓存刷新 6秒→2秒：新门/新互动更快被发现
                 D._cacheT = t
                 pcall(refreshCache)
             end
@@ -4387,8 +4711,8 @@ do
         Enabled   = false,   -- 默认关闭
         ShowFloat = false,   -- 悬浮圆点默认隐藏
         Interval  = 0.15,    -- 兼容旧接口
-        Cooldown  = 1.2,     -- 同一箱子触发冷却(秒)，大于开箱动画时长防连发
-        RangePad  = 15,      -- 箱前触发半径(m)，可调 2-40；服务器校验真实距离
+        Cooldown  = 0.6,     -- 同一箱子触发冷却(秒)：1.2→0.6，更快开箱
+        RangePad  = 22,      -- 箱前触发半径(m)：15→22；服务器校验真实距离
         Crates    = 0,       -- 缓存的开箱按钮数
         Nearby    = 0,       -- 本轮在半径内的箱数
         Fires     = 0,       -- 累计触发次数
@@ -4535,10 +4859,10 @@ do
         C._acc, C._cacheT = 0, os.clock()
         C.ScanConn = RUS.Heartbeat:Connect(function()
             C._acc = (C._acc or 0) + 1
-            if C._acc < 4 then return end
+            if C._acc < 2 then return end   -- 每2帧测距（原4帧，响应更快）
             C._acc = 0
             local t = os.clock()
-            if t - (C._cacheT or 0) >= 7 then  -- 静态箱：7秒才全量遍历一次（与门6秒错峰，降卡顿）
+            if t - (C._cacheT or 0) >= 2 then  -- 缓存刷新 7秒→2秒：新箱/新互动更快被发现
                 C._cacheT = t
                 pcall(refreshCache)
             end
@@ -6502,6 +6826,32 @@ local function buildObsidianUI(Library)
         end
     end)
 
+    -- ===== SCP-294 饮料效果显示（防护栏 · 拿起杯子显示效果）=====
+    local G294 = TabGuard:AddLeftGroupbox("SCP-294 饮料效果", "shield")
+    G294:AddToggle("guard294drink", {
+        Text = "拿起饮料显示效果（默认开）", Default = true,
+        Tooltip = "拿起 SCP-294 弹出的杯子时，屏幕中上方显示这杯饮料的名字与官方效果（回血/扣血/加速/定身/感染度等），6 秒自动收起。只读杯子 DrinkId 查表，不 hook、不改游戏、零卡顿",
+        Callback = function(v)
+            if G.SCP294_DRINK then G.SCP294_DRINK.SetEnabled(v) end
+            Library:Notify("SCP294 饮料效果 " .. (v and "已开启" or "已关闭"), 2)
+        end,
+    })
+    G294:AddLabel("读杯子 DrinkId → SCP294Drinks 官方表（50 种）")
+    local g294st = G294:AddLabel("状态：运行中 · 显示 0 次")
+    G294:AddButton({ Text = "列出全部饮料", Func = function()
+        Library:Notify("SCP294 饮料表已打印到控制台（G.SCP294_DRINK.List()）", 3)
+        print("[SCP294] " .. (G.SCP294_DRINK and G.SCP294_DRINK.List() or "N/A"))
+    end })
+    task.spawn(function()
+        while G.SCP294_DRINK do
+            pcall(function()
+                local d = G.SCP294_DRINK
+                setLbl(g294st, "状态：" .. tostring(d.Status) .. " · 显示 " .. tostring(d.Shown) .. " 次 · " .. tostring(d.Last))
+            end)
+            task.wait(0.5)
+        end
+    end)
+
     -- ===== 自动开门 v16.6（防护栏 · 门前直开免碰按钮）=====
     local GDOOR = TabGuard:AddRightGroupbox("自动开门", "door")
     GDOOR:AddToggle("autoDoor", {
@@ -7331,6 +7681,24 @@ local function buildNativeUI(pg)
         end
     end)
 
+    -- SCP-294 饮料效果显示（防护页末尾，避开上方坐标）
+    makeHint(1480, "─ SCP-294 饮料效果（拿起杯子显示效果·默认开）─", pageGuard, 11, Color3.fromRGB(120, 220, 255))
+    makeToggle(1498, "拿起饮料显示效果",
+        function() return G.SCP294_DRINK and G.SCP294_DRINK.Enabled or false end,
+        function(v) if G.SCP294_DRINK then G.SCP294_DRINK.SetEnabled(v) end end,
+        pageGuard)
+    local g294st2 = makeHint(1534, "状态：运行中 · 显示 0 次", pageGuard, 10, Color3.fromRGB(160, 200, 230))
+    makeHint(1552, "读杯子 DrinkId → 查官方表 · G.SCP294_DRINK.List()", pageGuard, 10)
+    task.spawn(function()
+        while gui.Parent and G.SCP294_DRINK do
+            pcall(function()
+                local d = G.SCP294_DRINK
+                g294st2.Text = "状态：" .. tostring(d.Status) .. " · 显示 " .. tostring(d.Shown) .. " 次 · " .. tostring(d.Last)
+            end)
+            task.wait(0.5)
+        end
+    end)
+
     -- 自动开门 v16.6
     makeHint(766, "─ 自动开门（门前直开·免碰按钮）─", pageGuard, 11, Color3.fromRGB(120, 210, 255))
     makeToggle(784, "门前自动开门(默认关)",
@@ -7621,3 +7989,578 @@ task.spawn(function()
     local ok, err = pcall(buildUI)
     if not ok then warn("[ESP] UI 加载失败: " .. tostring(err)) end
 end)
+
+-- ============================================================
+-- 【内嵌】SCP-610 感染防护 + 新SCP透视（原独立脚本整合）
+-- 防护：感染度属性 SCP610Infection 一出现就清零；自身 SCP610Host 标签立即移除
+-- 透视：610 宿主/感染体 + SCP610_Mother 核心；排除 999/131/106；500m 范围
+-- 联动：受主界面「SCP透视」总开关控制（轮询 SCPEnabled，不包装主函数）
+-- API：G.SCP610_DEF.{On,Off,SetESP,SetAnti,SetRange,Dump}
+-- ============================================================
+do
+    local Gg = getgenv()
+    pcall(function()
+        local old = Gg.SCP610_DEF
+        if old then
+            if old.Off then pcall(old.Off) end
+            if old.Conns then for _, c in ipairs(old.Conns) do pcall(function() c:Disconnect() end) end end
+        end
+    end)
+
+    local WS      = workspace
+    local CS      = game:GetService("CollectionService")
+    local RS      = game:GetService("RunService")
+    local Players = game:GetService("Players")
+    local LP      = Players.LocalPlayer
+
+    local D = {
+        Enabled = true, AntiInfect = true, RemoveHost = true, ShowDanger = true,
+        MeterName = "SCP610Infection", HostTag = "SCP610Host",
+        DangerRadius = 22, Range = 500,
+        Marks = {}, Conns = {}, ClampCount = 0, HostRemoveCount = 0,
+    }
+    Gg.SCP610_DEF = D
+
+    local HEAVY = Enum.Font.GothamBold
+    pcall(function() HEAVY = Enum.Font.GothamBlack end)
+    local OUTLINE = Color3.new(0, 0, 0)
+
+    local EXCLUDE = { ["999"] = true, ["131"] = true, ["106"] = true }
+    local SKIP_SUFFIX = { "Cup", "FeedScreen", "Passable", "Sinkhole", "Feed", "Screen",
+                          "Dragon", "Follower", "Cable", "Conduit", "Wire" }
+    local DEAD_KW = { "corpse", "ragdoll", "dead", "remains", "oldbody", "debris" }
+
+    local function compact(s) return string.gsub(string.lower(tostring(s or "")), "[-_%s]", "") end
+
+    local function labelFromTag(tag)
+        local c = compact(tag)
+        for _, sf in ipairs(SKIP_SUFFIX) do if c:find(compact(sf), 1, true) then return nil end end
+        for _, w in ipairs(DEAD_KW) do if c:find(w, 1, true) then return nil end end
+        local n = string.match(c, "scp(%d+)")
+        if not n or #n > 4 then return nil end
+        if EXCLUDE[n] then return nil end
+        return "SCP-" .. n, n
+    end
+
+    local DANGER = {
+        ["049"]=true, ["096"]=true, ["106"]=true, ["173"]=true, ["303"]=true,
+        ["610"]=true, ["650"]=true, ["682"]=true, ["939"]=true, ["035"]=true,
+        ["1762"]=true, ["6161"]=true, ["079"]=true,
+    }
+    local function colorFor(n)
+        if DANGER[n] then return Color3.fromRGB(255, 40, 40) end
+        local v = tonumber(n) or 0
+        local pal = { Color3.fromRGB(255,170,70), Color3.fromRGB(120,210,255),
+                      Color3.fromRGB(190,130,255), Color3.fromRGB(130,255,170) }
+        return pal[(v % #pal) + 1]
+    end
+
+    local function safeParent(inst)
+        local ok = pcall(function() inst.Parent = game:GetService("CoreGui") end)
+        if not ok then pcall(function() inst.Parent = WS end) end
+    end
+
+    local function addMark(o, label, n, danger)
+        if D.Marks[o] then return end
+        local bg = Instance.new("BillboardGui")
+        bg.Name = "DF_BB"
+        bg.Adornee = o
+        bg.AlwaysOnTop = true
+        bg.MaxDistance = 5000
+        bg.Size = UDim2.new(0, 200, 0, 40)
+        bg.StudsOffset = Vector3.new(0, 1.2, 0)
+        safeParent(bg)
+        local tl = Instance.new("TextLabel")
+        tl.Size = UDim2.new(1, 0, 1, 0)
+        tl.BackgroundTransparency = 1
+        tl.TextColor3 = colorFor(n)
+        tl.TextStrokeColor3 = OUTLINE
+        tl.TextStrokeTransparency = 0
+        tl.TextXAlignment = Enum.TextXAlignment.Center
+        tl.TextYAlignment = Enum.TextYAlignment.Center
+        tl.TextSize = 16
+        tl.Font = HEAVY
+        tl.Text = label
+        tl.Parent = bg
+        D.Marks[o] = { bg = bg, tl = tl, label = label, danger = danger, applied = tl.Text }
+    end
+
+    local function delMark(o)
+        local r = D.Marks[o]
+        if not r then return end
+        pcall(function() r.bg:Destroy() end)
+        D.Marks[o] = nil
+    end
+
+    local function isDanger(o)
+        local ok, tags = pcall(function() return CS:GetTags(o) end)
+        if ok then
+            for _, t in ipairs(tags) do
+                local lt = t:lower()
+                if lt == "scp610host" or (lt:find("610") and (lt:find("infected") or lt:find("host"))) then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    local function trackObject(o)
+        if not D.ShowDanger then return end
+        if not (o:IsA("Model") or o:IsA("BasePart")) then return end
+        if o.Name == "SCP610_Mother" then
+            addMark(o, "SCP-610 核心", "610", true) return
+        end
+        local okPl, pl = pcall(function() return Players:GetPlayerFromCharacter(o) end)
+        if okPl and pl then return end
+        if isDanger(o) then addMark(o, "SCP-610 [感染源]", "610", true) return end
+        if o:FindFirstChildOfClass("Humanoid") then return end
+        local ok, tags = pcall(function() return CS:GetTags(o) end)
+        if ok then
+            for _, t in ipairs(tags) do
+                local label, n = labelFromTag(t)
+                if label then addMark(o, label, n, false) return end
+            end
+        end
+    end
+
+    local tagList = {}
+    for _, t in ipairs(CS:GetAllTags()) do
+        if string.find(string.upper(t), "SCP", 1, true) then tagList[#tagList + 1] = t end
+    end
+    for _, t in ipairs(tagList) do
+        for _, o in ipairs(CS:GetTagged(t)) do trackObject(o) end
+        table.insert(D.Conns, CS:GetInstanceAddedSignal(t):Connect(function(o) trackObject(o) end))
+        table.insert(D.Conns, CS:GetInstanceRemovedSignal(t):Connect(function(o) delMark(o) end))
+    end
+
+    local function findMother()
+        local ok, m = pcall(function()
+            local w = WS:FindFirstChild("SCP610World")
+            return w and w:FindFirstChild("SCP610_Mother") or nil
+        end)
+        if ok and m then trackObject(m) end
+    end
+    findMother()
+    table.insert(D.Conns, WS.DescendantAdded:Connect(function(o)
+        if o.Name == "SCP610_Mother" then task.defer(findMother) end
+    end))
+
+    local function protectChar(ch)
+        if not ch or ch ~= (LP and LP.Character) then return end
+        if D.AntiInfect then
+            pcall(function()
+                if ch:GetAttribute(D.MeterName) ~= nil then
+                    ch:SetAttribute(D.MeterName, 0)
+                    D.ClampCount = D.ClampCount + 1
+                end
+            end)
+            table.insert(D.Conns, ch:GetAttributeChangedSignal(D.MeterName):Connect(function()
+                if not D.Enabled or not D.AntiInfect then return end
+                pcall(function()
+                    local v = ch:GetAttribute(D.MeterName)
+                    if type(v) == "number" and v > 0 then
+                        ch:SetAttribute(D.MeterName, 0)
+                        D.ClampCount = D.ClampCount + 1
+                    end
+                end)
+            end))
+        end
+        if D.RemoveHost then
+            pcall(function()
+                if CS:HasTag(ch, D.HostTag) then
+                    CS:RemoveTag(ch, D.HostTag)
+                    D.HostRemoveCount = D.HostRemoveCount + 1
+                end
+            end)
+            table.insert(D.Conns, CS:GetInstanceAddedSignal(D.HostTag):Connect(function(obj)
+                if not D.Enabled or not D.RemoveHost then return end
+                if obj == (LP and LP.Character) then
+                    pcall(function()
+                        CS:RemoveTag(obj, D.HostTag)
+                        D.HostRemoveCount = D.HostRemoveCount + 1
+                    end)
+                end
+            end))
+        end
+    end
+    if LP then
+        table.insert(D.Conns, LP.CharacterAdded:Connect(function(ch) task.defer(protectChar, ch) end))
+        if LP.Character then task.defer(protectChar, LP.Character) end
+    end
+
+    local tick = 0
+    table.insert(D.Conns, RS.Heartbeat:Connect(function(dt)
+        tick = tick + dt
+        if tick < 0.5 then return end
+        tick = 0
+        if not D.Enabled then return end
+        if D.ShowDanger then findMother() end
+        local ch = LP and LP.Character
+        if D.AntiInfect and ch then
+            pcall(function()
+                local v = ch:GetAttribute(D.MeterName)
+                if type(v) == "number" and v > 0 then
+                    ch:SetAttribute(D.MeterName, 0)
+                    D.ClampCount = D.ClampCount + 1
+                end
+            end)
+        end
+        if D.RemoveHost and ch then
+            pcall(function()
+                if CS:HasTag(ch, D.HostTag) then CS:RemoveTag(ch, D.HostTag); D.HostRemoveCount = D.HostRemoveCount + 1 end
+            end)
+        end
+        local cam = WS.CurrentCamera
+        if not cam then return end
+        local cp = cam.CFrame.Position
+        for o, r in pairs(D.Marks) do
+            if not o.Parent then
+                delMark(o)
+            else
+                local pos
+                pcall(function()
+                    if o:IsA("BasePart") then pos = o.Position else pos = o:GetPivot().Position end
+                end)
+                if pos then
+                    local d = (cp - pos).Magnitude
+                    if d > D.Range then r.bg.Enabled = false
+                    else
+                        r.bg.Enabled = true
+                        local txt = r.label .. " " .. math.floor(d) .. "m"
+                        if r.applied ~= txt then r.applied = txt; r.tl.Text = txt end
+                    end
+                end
+            end
+        end
+    end))
+
+    D.On = function()
+        D.Enabled = true
+        local ch = LP and LP.Character
+        if ch then task.defer(protectChar, ch) end
+        for _, t in ipairs(tagList) do
+            for _, o in ipairs(CS:GetTagged(t)) do trackObject(o) end
+        end
+        findMother()
+    end
+    D.Off = function()
+        D.Enabled = false
+        for o, _ in pairs(D.Marks) do delMark(o) end
+    end
+    D.SetESP = function(v)
+        v = v and true or false
+        D.ShowDanger = v
+        if v then
+            for _, t in ipairs(tagList) do
+                for _, o in ipairs(CS:GetTagged(t)) do trackObject(o) end
+            end
+            findMother()
+        else
+            for o in pairs(D.Marks) do delMark(o) end
+        end
+        return D.ShowDanger
+    end
+    D.SetAnti = function(v) D.AntiInfect = v and true or false; return D.AntiInfect end
+    D.SetRange = function(m) if type(m) == "number" and m > 0 then D.Range = m end; return D.Range end
+    D.Dump = function()
+        local t = {}
+        for _, r in pairs(D.Marks) do t[#t + 1] = r.applied end
+        table.sort(t)
+        local meter = "nil"
+        pcall(function() local ch=LP.Character; meter = ch and tostring(ch:GetAttribute(D.MeterName)) or "nochar" end)
+        return string.format("DEF Enabled=%s Anti=%s Host=%s Range=%d Clamp=%d HostRem=%d Meter=%s Tracked=%d -> %s",
+            tostring(D.Enabled), tostring(D.AntiInfect), tostring(D.RemoveHost), D.Range, D.ClampCount, D.HostRemoveCount,
+            meter, #t, table.concat(t, ", "))
+    end
+
+    -- 联动主界面「SCP透视」总开关（轮询 SCPEnabled，零包装）
+    local lastMaster = nil
+    local function syncAll(v)
+        v = v and true or false
+        pcall(function() D.SetESP(v) end)
+        pcall(function()
+            local N = Gg.NEWSCP_ESP
+            if N then if v then if N.On then N.On() end else if N.Off then N.Off() end end end
+        end)
+    end
+    table.insert(D.Conns, RS.Heartbeat:Connect(function()
+        if not D.Enabled then return end
+        local E = Gg.CRATE_ESP
+        if not E then return end
+        local cur = E.SCPEnabled ~= false
+        if lastMaster == nil then lastMaster = cur end
+        if cur ~= lastMaster then
+            lastMaster = cur
+            syncAll(cur)
+        end
+    end))
+    do
+        local E = Gg.CRATE_ESP
+        if E then lastMaster = E.SCPEnabled ~= false; syncAll(lastMaster) end
+    end
+
+    print("[ESP] SCP610 防护+透视 已内嵌装载 · " .. D.Dump())
+end
+
+-- ============================================================
+-- 【内嵌】互动修复 INTERACTFIX（原生手指图标 + 可拖动 + 秒互动）
+-- 秒互动：靠近可互动对象即自动触发（Auto 默认开）；图标仍显示可拖动，轻点也可触发
+-- 原则：不修改游戏原生按钮/TouchGui/界面层，不影响视角与走路
+-- API：G.INTERACTFIX.{On,Off,SetAuto,SetPos,ResetPos,Dump}
+-- ============================================================
+do
+    local Gg = getgenv()
+    if Gg.INTERACTFIX and Gg.INTERACTFIX.Off then pcall(function() Gg.INTERACTFIX.Off() end) end
+    Gg.INTERACTFIX_GEN = (Gg.INTERACTFIX_GEN or 0) + 1
+    local MY_GEN = Gg.INTERACTFIX_GEN
+
+    local Players = game:GetService("Players")
+    local PPS = game:GetService("ProximityPromptService")
+    local LP = Players.LocalPlayer
+    local FPP = (Gg and Gg.fireproximityprompt) or fireproximityprompt or (Gg and Gg.FPP)
+
+    local S = {
+        Enabled = true,
+        Auto    = true,     -- 秒互动：可互动即自动触发
+        current = nil,
+        action  = "",
+        fired   = 0,
+        lastFire = {},      -- [prompt] = os.clock() 单点冷却，防狂刷
+        CoolDown = 0.25,
+    }
+
+    local pg = LP:FindFirstChild("PlayerGui") or LP:WaitForChild("PlayerGui")
+    local cam = workspace.CurrentCamera
+    local function vp() return cam and cam.ViewportSize or Vector2.new(1920, 1080) end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "INTERACTFIX_GUI"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.DisplayOrder = 200
+    gui.Enabled = true
+    gui.Parent = pg
+
+    local SZ = 68
+    local function defaultPos()
+        local v = vp()
+        return Vector2.new(math.floor(v.X / 2 - SZ / 2), math.floor(v.Y - SZ - 90))
+    end
+    local saved = Gg.INTERACTFIX_POS or defaultPos()
+
+    local btn = Instance.new("ImageButton")
+    btn.Name = "InteractBtn"
+    btn.Size = UDim2.new(0, SZ, 0, SZ)
+    btn.Position = UDim2.new(0, saved.X, 0, saved.Y)
+    btn.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    btn.BackgroundTransparency = 0.5
+    btn.Image = ""
+    btn.ImageTransparency = 1
+    btn.Active = true
+    btn.Visible = false
+    btn.Parent = gui
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0.5, 0)
+    corner.Parent = btn
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.new(1, 1, 1)
+    stroke.Transparency = 0.6
+    stroke.Thickness = 2
+    stroke.Parent = btn
+
+    local icon = Instance.new("ImageLabel")
+    icon.Name = "ButtonImage"
+    icon.Size = UDim2.new(0, 28, 0, 35)
+    icon.Position = UDim2.new(0.5, 0, 0.45, 0)
+    icon.AnchorPoint = Vector2.new(0.5, 0.5)
+    icon.BackgroundTransparency = 1
+    icon.Image = "rbxasset://textures/ui/Controls/TouchTapIcon.png"
+    icon.ImageTransparency = 0
+    icon.Parent = btn
+
+    local actionLbl = Instance.new("TextLabel")
+    actionLbl.Name = "ActionText"
+    actionLbl.Size = UDim2.new(0, 110, 0, 20)
+    actionLbl.Position = UDim2.new(0.5, 0, 1, 4)
+    actionLbl.AnchorPoint = Vector2.new(0.5, 0)
+    actionLbl.BackgroundTransparency = 1
+    actionLbl.TextColor3 = Color3.new(1, 1, 1)
+    actionLbl.TextStrokeTransparency = 0.4
+    actionLbl.TextStrokeColor3 = Color3.new(0, 0, 0)
+    actionLbl.Font = Enum.Font.GothamBold
+    actionLbl.TextSize = 14
+    actionLbl.Text = "互动"
+    actionLbl.Parent = btn
+
+    -- 触发（带单点冷却，防同一目标每帧狂刷）
+    local function firePrompt(p)
+        if not p or not FPP then return end
+        local now = os.clock()
+        local last = S.lastFire[p]
+        if last and (now - last) < S.CoolDown then return end
+        S.lastFire[p] = now
+        local ok = pcall(function() FPP(p, 1, true) end)
+        if ok then S.fired = S.fired + 1 end
+    end
+
+    local function trigger()
+        firePrompt(S.current)
+    end
+
+    -- 拖动
+    local dragging, moved = false, false
+    local startInput, startPos = Vector2.zero, Vector2.zero
+    btn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch
+            or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true; moved = false
+            startInput = Vector2.new(input.Position.X, input.Position.Y)
+            startPos = Vector2.new(btn.Position.X.Offset, btn.Position.Y.Offset)
+        end
+    end)
+    btn.InputChanged:Connect(function(input)
+        if not dragging then return end
+        if input.UserInputType == Enum.UserInputType.Touch
+            or input.UserInputType == Enum.UserInputType.MouseMovement then
+            local now = Vector2.new(input.Position.X, input.Position.Y)
+            local dx, dy = now.X - startInput.X, now.Y - startInput.Y
+            if (dx * dx + dy * dy) > 36 then moved = true end
+            if moved then
+                local v = vp()
+                local nx = math.clamp(startPos.X + dx, 0, v.X - SZ)
+                local ny = math.clamp(startPos.Y + dy, 0, v.Y - SZ)
+                btn.Position = UDim2.new(0, nx, 0, ny)
+            end
+        end
+    end)
+    btn.InputEnded:Connect(function()
+        if not dragging then return end
+        dragging = false
+        if moved then
+            Gg.INTERACTFIX_POS = Vector2.new(btn.Position.X.Offset, btn.Position.Y.Offset)
+        else
+            trigger()
+        end
+    end)
+
+    local function isIgnored(prompt)
+        local name = tostring(prompt.Name)
+        local action = tostring(prompt.ActionText or "")
+        local obj = tostring(prompt.ObjectText or "")
+        if name:lower():find("changelog") or action:lower():find("changelog") or obj:lower():find("changelog") then
+            return true
+        end
+        local ok, par = pcall(function() return prompt:FindFirstAncestorOfClass("Model") end)
+        local ch = LP.Character
+        if ok and par and ch and par == ch then return true end
+        local ok2, anc = pcall(function() return prompt:FindFirstAncestor("Backpack") end)
+        if ok2 and anc then return true end
+        local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            local pp = nil
+            pcall(function()
+                local par2 = prompt.Parent
+                if par2:IsA("BasePart") then pp = par2.Position
+                elseif par2:IsA("Attachment") then pp = par2.WorldPosition end
+            end)
+            if pp and (pp - hrp.Position).Magnitude > 30 then return true end
+        end
+        return false
+    end
+
+    local function isAlive(prompt)
+        if not prompt or not prompt.Parent then return false end
+        local ok, en = pcall(function() return prompt.Enabled end)
+        return ok and en == true
+    end
+
+    local active = {}
+    local function refreshUI()
+        local pick = nil
+        for p in pairs(active) do
+            if isAlive(p) and not isIgnored(p) then pick = p break end
+        end
+        if pick ~= S.current then
+            S.current = pick
+            S.action = pick and tostring(pick.ActionText or "") or ""
+            pcall(function()
+                if pick then
+                    local txt = (S.action ~= "" and S.action or "互动")
+                    if #txt > 12 then txt = txt:sub(1, 12) end
+                    actionLbl.Text = txt
+                    btn.Visible = true
+                else
+                    btn.Visible = false
+                end
+            end)
+        end
+    end
+
+    local shownConn = PPS.PromptShown:Connect(function(prompt)
+        if not S.Enabled then return end
+        if not (prompt and prompt:IsA("ProximityPrompt")) then return end
+        active[prompt] = true
+        refreshUI()
+        -- 秒互动：出现即触发
+        if S.Auto and not isIgnored(prompt) then firePrompt(prompt) end
+    end)
+    local hiddenConn = PPS.PromptHidden:Connect(function(prompt)
+        active[prompt] = nil
+        S.lastFire[prompt] = nil
+        refreshUI()
+    end)
+
+    -- 兜底轮询：0.12s，清理失效 + 秒互动自动触发（防 PromptShown 不触发的常驻点）
+    local guardTask = task.spawn(function()
+        while true do
+            task.wait(0.12)
+            if Gg.INTERACTFIX_GEN ~= MY_GEN then break end
+            if S.Enabled then
+                local changed = false
+                for p in pairs(active) do
+                    if not isAlive(p) or isIgnored(p) then
+                        active[p] = nil; changed = true
+                    elseif S.Auto then
+                        firePrompt(p)   -- 秒互动兜底：有效可互动点直接触发
+                    end
+                end
+                if changed then pcall(refreshUI) end
+            end
+        end
+    end)
+
+    function S.On()
+        S.Enabled = true
+        pcall(function() gui.Enabled = true end)
+        refreshUI()
+    end
+    function S.Off()
+        S.Enabled = false
+        for p in pairs(active) do active[p] = nil end
+        S.current = nil; S.action = ""
+        pcall(function() btn.Visible = false end)
+    end
+    function S.SetAuto(v) S.Auto = v and true or false; return S.Auto end
+    function S.SetPos(x, y)
+        local v = vp()
+        local px = math.floor(x * v.X - SZ / 2)
+        local py = math.floor(y * v.Y - SZ / 2)
+        btn.Position = UDim2.new(0, px, 0, py)
+        Gg.INTERACTFIX_POS = Vector2.new(px, py)
+    end
+    function S.ResetPos()
+        local p = defaultPos()
+        btn.Position = UDim2.new(0, p.X, 0, p.Y)
+        Gg.INTERACTFIX_POS = p
+    end
+    function S.Dump()
+        print(string.format(
+            "[INTERACTFIX] Enabled=%s Auto=%s FPP=%s fired=%d action=%s pos=(%d,%d)",
+            tostring(S.Enabled), tostring(S.Auto), tostring(FPP ~= nil), S.fired, S.action,
+            btn.Position.X.Offset, btn.Position.Y.Offset))
+    end
+
+    Gg.INTERACTFIX = S
+    print("[ESP] 互动修复已内嵌装载 · 秒互动 · 原生手指图标 · 可拖动")
+end
